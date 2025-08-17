@@ -1,0 +1,42 @@
+# Python 3.12.3
+
+# --- Web framework ---
+flask==3.0.3
+werkzeug==3.0.3
+itsdangerous==2.2.0
+click==8.1.7
+jinja2==3.1.4
+
+# --- Celery / Task queue ---
+celery==5.3.6
+redis==5.0.7
+
+# --- Database ---
+pymongo==4.8.0
+dnspython==2.7.0          # for MongoDB Atlas SRV
+gridfs                    # bundled with pymongo
+
+# --- Utilities ---
+requests==2.32.3
+python-dateutil==2.9.0.post0
+feedparser==6.0.11
+
+# --- Parsing / Content extraction ---
+beautifulsoup4==4.12.3
+lxml==5.3.0
+readability-lxml==0.8.1
+html5lib==1.1              # fallback parser
+
+# --- NLP / ML / Vector search ---
+numpy==1.26.4
+faiss-cpu==1.8.0
+sentence-transformers==3.0.1
+torch==2.3.1
+transformers==4.41.2
+scikit-learn==1.5.1
+
+# --- PDF handling ---
+PyMuPDF==1.24.9
+
+# --- Optional (to avoid crashes in different environments) ---
+tqdm==4.66.4
