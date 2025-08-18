@@ -25,13 +25,15 @@ readability-lxml==0.8.1
 html5lib==1.1
 
 # --- NLP / ML / Vector search ---
-numpy>=1.26,<3.0 
+numpy>=1.26,<3.0
 faiss-cpu==1.12.0
-sentence-transformers==3.0.1
-torch==2.5.1
-transformers==4.41.2
+sentence-transformers==3.1.1
+torch==2.8.0
+transformers==4.55.2
 scikit-learn==1.5.1
-tokenizers==0.19.1
+tokenizers==0.21.4
+# 如拉取 torch 慢，可改为：
+# torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
 
 # --- PDF handling ---
 PyMuPDF==1.24.9
