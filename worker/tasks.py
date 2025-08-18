@@ -2,6 +2,10 @@ from .celery_app import celery
 import subprocess, sys
 from pathlib import Path
 import shlex
+# worker/tasks.py
+import os, time
+from celery.signals import worker_ready
+import redis
 
 BASE = Path(__file__).resolve().parents[1]
 
@@ -28,7 +32,7 @@ def run_fetch(self):
     return _run("task_fetch.py")
 
 @celery.task(bind=True)
-def run_fetch_and_reco(self):
+def run_fetch_and_reco(self, name="worker.run_fetch_and_reco"):
     self.update_state(state="PROGRESS", meta={"step": "fetch", "percent": 20})
     res1 = _run("task_fetch.py")
 
@@ -36,3 +40,23 @@ def run_fetch_and_reco(self):
     res2 = _run("task_cybok_reco_gridfs.py")
 
     return {"fetch": res1, "reco": res2}
+
+
+
+def _should_kick_once(ttl_seconds=300) -> bool:
+    url = os.getenv("REDIS_URL", "redis://default:FY0eHpAwCj2eRxoTiUcJTn4T8dkmLWGE@redis-14436.c114.us-east-1-4.ec2.redns.redis-cloud.com:14436/0")
+    r = redis.from_url(url)
+    key = "once:kickoff:run_fetch_and_reco"
+    ok = r.setnx(key, int(time.time()))
+    if ok:
+        r.expire(key, ttl_seconds) 
+    return ok
+@worker_ready.connect
+def _kickoff_on_worker_ready(sender, **kwargs):
+    try:
+        if _should_kick_once(ttl_seconds=300):
+            sender.app.send_task("worker.run_fetch_and_reco")
+        else:
+            pass
+    except Exception as e:
+        print(f"[worker_ready] kickoff failed: {e}")
