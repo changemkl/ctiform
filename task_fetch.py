@@ -370,34 +370,6 @@ def crawl_msrc_blog(limit=40):
         logging.error("[msrc_blog] error: %s", e)
     return docs
 
-def crawl_threatfox(limit=60):
-    logging.info("[threatfox] min_role=admin limit=%d", limit)
-    feed_url = "https://threatfox.abuse.ch/feeds/rss/"
-    docs = []
-    try:
-        feed = feedparser.parse(feed_url)
-        if not getattr(feed, "entries", None):
-            logging.info("[threatfox] no items.")
-            return []
-        for e in feed.entries[:limit]:
-            link = (getattr(e, "link", "") or "").strip() or "https://threatfox.abuse.ch"
-            title = clean_text(getattr(e, "title", "") or "ThreatFox item")
-            raw = clean_text(getattr(e, "summary", "") or getattr(e, "description", "") or "")
-            content = make_summary(raw, max_chars=260)
-            docs.append({
-                "source": "threatfox",
-                "source_id": f"threatfox:{hashlib.sha1((link or title).encode()).hexdigest()}",
-                "title": title,
-                "url": link,
-                "content": content,
-                "timestamp": _entry_datetime(e),
-                "min_role": "admin",
-                "allowed_roles": roles_at_or_above("admin"),
-                "origin": urlparse(link).netloc if link else "threatfox.abuse.ch",
-            })
-    except Exception as e:
-        logging.error("[threatfox] error: %s", e)
-    return docs
 
 # ---------- NVD & Exploit-DB ----------
 def crawl_nvd_recent(days=7, max_items=200):
@@ -592,7 +564,6 @@ def main():
         ("cisa_kev", crawl_cisa_kev, {"limit": 2000}),
         ("krebsonsecurity", crawl_krebsonsecurity, {"limit": 40}),
         ("msrc_blog", crawl_msrc_blog, {"limit": 40}),
-        ("threatfox", crawl_threatfox, {"limit": 60}),
         ("nvd", crawl_nvd_recent, {"days": 7, "max_items": 200}),
         ("exploitdb", crawl_exploitdb, {"limit": 60}),
     ]
