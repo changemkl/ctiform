@@ -1,11 +1,12 @@
 # task_fetch.py
-import os, re, logging, hashlib, html
+import os, re, logging, hashlib, html, time, random
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 import requests
 import feedparser
 from pymongo import MongoClient, UpdateOne
+from pymongo.errors import AutoReconnect, ConnectionFailure, NetworkTimeout, ExecutionTimeout, BulkWriteError
 
 # ---------- Configuration ----------
 MONGODB_URI = os.getenv(
@@ -14,6 +15,12 @@ MONGODB_URI = os.getenv(
 )
 DB_NAME = os.getenv("DB_NAME", "cti_platform")
 NVD_API_KEY = os.getenv("NVD_API_KEY", "").strip()
+
+# Exponential backoff parameters
+MAX_RETRIES = int(os.getenv("BACKOFF_MAX_RETRIES", "5"))        # number of retry attempts
+BASE_DELAY = float(os.getenv("BACKOFF_BASE_SECONDS", "0.5"))     # initial delay in seconds
+MAX_DELAY = float(os.getenv("BACKOFF_MAX_SECONDS", "20"))        # cap delay
+JITTER_BOUND = float(os.getenv("BACKOFF_JITTER_SECONDS", "0.5")) # additional random jitter [0, JITTER_BOUND]
 
 ROLES = ["public", "pro", "admin"]
 ROLE_ORDER = {"public": 0, "pro": 1, "admin": 2}
@@ -52,6 +59,88 @@ def extract_cves(s: str | None):
     if not s:
         return []
     return sorted(set(m.upper() for m in CVE_RE.findall(s)))
+
+# ====== Backoff helpers ======
+def _retryable_http(resp: requests.Response | None, err: Exception | None) -> bool:
+    """Decide if an HTTP operation is retryable (network errors, throttling, server errors)."""
+    if err is not None:
+        return True
+    if resp is None:
+        return True
+    return resp.status_code in (408, 409, 425, 429, 500, 502, 503, 504)
+
+def _sleep_backoff(attempt: int):
+    """Exponential backoff with bounded jitter."""
+    delay = min(MAX_DELAY, BASE_DELAY * (2 ** attempt))
+    delay += random.uniform(0, JITTER_BOUND)
+    time.sleep(delay)
+
+_session = requests.Session()
+
+def http_get(url: str, **kwargs) -> requests.Response:
+    """GET with exponential backoff."""
+    last_err = None
+    for i in range(MAX_RETRIES):
+        resp = None
+        try:
+            resp = _session.get(url, **kwargs)
+            if not _retryable_http(resp, None):
+                return resp
+            logging.warning("HTTP GET %s -> %s; retry %d/%d", url, resp.status_code, i+1, MAX_RETRIES)
+        except Exception as e:
+            last_err = e
+            logging.warning("HTTP GET %s error: %s; retry %d/%d", url, e, i+1, MAX_RETRIES)
+        _sleep_backoff(i)
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"HTTP GET failed after {MAX_RETRIES} retries: {url}")
+
+def http_post(url: str, **kwargs) -> requests.Response:
+    """POST with exponential backoff."""
+    last_err = None
+    for i in range(MAX_RETRIES):
+        resp = None
+        try:
+            resp = _session.post(url, **kwargs)
+            if not _retryable_http(resp, None):
+                return resp
+            logging.warning("HTTP POST %s -> %s; retry %d/%d", url, resp.status_code, i+1, MAX_RETRIES)
+        except Exception as e:
+            last_err = e
+            logging.warning("HTTP POST %s error: %s; retry %d/%d", url, e, i+1, MAX_RETRIES)
+        _sleep_backoff(i)
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"HTTP POST failed after {MAX_RETRIES} retries: {url}")
+
+def parse_feed_with_backoff(feed_url: str):
+    """feedparser.parse with exponential backoff."""
+    last_err = None
+    for i in range(MAX_RETRIES):
+        try:
+            return feedparser.parse(feed_url)
+        except Exception as e:
+            last_err = e
+            logging.warning("feedparser %s error: %s; retry %d/%d", feed_url, e, i+1, MAX_RETRIES)
+            _sleep_backoff(i)
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"feedparser failed after {MAX_RETRIES} retries: {feed_url}")
+
+def bulk_write_with_backoff(ops):
+    """Mongo bulk_write with exponential backoff on transient errors."""
+    last_err = None
+    for i in range(MAX_RETRIES):
+        try:
+            return coll.bulk_write(ops, ordered=False)
+        except (AutoReconnect, ConnectionFailure, NetworkTimeout, ExecutionTimeout, BulkWriteError) as e:
+            last_err = e
+            logging.warning("Mongo bulk_write transient error: %s; retry %d/%d", e, i+1, MAX_RETRIES)
+            _sleep_backoff(i)
+        except Exception:
+            raise
+    if last_err:
+        raise last_err
 
 # ====== Common: sentence splitting / denoising / summarization ======
 _SENT_SPLIT = re.compile(r"(?<=[。！？!?\.])\s+")
@@ -235,7 +324,7 @@ def upsert_many(docs):
             upsert=True
         ))
     try:
-        res = coll.bulk_write(ops, ordered=False)
+        res = bulk_write_with_backoff(ops)
         ins = getattr(res, "upserted_count", 0)
         return ins, len(ops) - ins
     except Exception as e:
@@ -267,7 +356,7 @@ def crawl_cisa_kev(limit=2000):
     docs, now = [], datetime.now(timezone.utc)
     for url in urls:
         try:
-            r = requests.get(url, timeout=30, headers=UA)
+            r = http_get(url, timeout=30, headers=UA)
             r.raise_for_status()
             data = r.json()
             vulns = data.get("vulnerabilities") or []
@@ -300,13 +389,13 @@ def crawl_krebsonsecurity(limit=40):
     feed_url = "https://krebsonsecurity.com/feed/"
     docs = []
     try:
-        feed = feedparser.parse(feed_url)
+        feed = parse_feed_with_backoff(feed_url)
         for e in feed.entries[:limit]:
             link = (getattr(e, "link", "") or "").strip()
             if not link:
                 continue
             try:
-                r = requests.get(link, timeout=25, headers=UA)
+                r = http_get(link, timeout=25, headers=UA)
                 r.raise_for_status()
                 # Krebs: summary from body paragraphs only (no title mixed in)
                 raw = extract_krebs_body(r.text)
@@ -336,13 +425,13 @@ def crawl_msrc_blog(limit=40):
     feed_url = "https://msrc.microsoft.com/blog/feed/"
     docs = []
     try:
-        feed = feedparser.parse(feed_url)
+        feed = parse_feed_with_backoff(feed_url)
         for e in feed.entries[:limit]:
             link = (getattr(e, "link", "") or "").strip()
             if not link:
                 continue
             try:
-                r = requests.get(link, timeout=25, headers=UA)
+                r = http_get(link, timeout=25, headers=UA)
                 r.raise_for_status()
                 raw = extract_msrc_body(r.text)  # Only body text (no title)
                 # Title from RSS or <title>, but do not prepend to summary
@@ -388,7 +477,7 @@ def crawl_nvd_recent(days=7, max_items=200):
 
     docs = []
     try:
-        r = requests.get(
+        r = http_get(
             "https://services.nvd.nist.gov/rest/json/cves/2.0",
             params=params, headers=headers, timeout=30
         )
@@ -466,7 +555,7 @@ def crawl_exploitdb(limit=60):
     feed_url = "https://www.exploit-db.com/rss.xml"
     docs = []
     try:
-        feed = feedparser.parse(feed_url)
+        feed = parse_feed_with_backoff(feed_url)
         for e in feed.entries[:limit]:
             link = (getattr(e, "link", "") or "").strip()
             if not link:
@@ -508,7 +597,7 @@ def crawl_user_rss(limit_sources=200, max_items_per_feed=40, timeout=25):
         if role not in ROLES:
             role = "public"
         try:
-            feed = feedparser.parse(feed_url)
+            feed = parse_feed_with_backoff(feed_url)
             cnt = 0
             for e in feed.entries:
                 if cnt >= max_items_per_feed:
@@ -518,7 +607,7 @@ def crawl_user_rss(limit_sources=200, max_items_per_feed=40, timeout=25):
                     continue
 
                 try:
-                    resp = requests.get(link, timeout=timeout, headers=UA)
+                    resp = http_get(link, timeout=timeout, headers=UA)
                     resp.raise_for_status()
                     # Generic main-body -> summary (do not prepend the title)
                     _, full = extract_main_content(resp.text)
