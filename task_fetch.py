@@ -1,768 +1,1212 @@
-# task_fetch.py
-import os, re, logging, hashlib, html
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urlparse
-
+# app.py
+import os, math, re
+from datetime import datetime, timezone
+from functools import lru_cache, wraps
+from urllib.parse import urlencode
+from celery.result import AsyncResult
+from worker.celery_app import celery
+import subprocess, sys
+from worker.tasks import run_fetch_and_reco, run_fetch_user_rss_once
 import requests
-import feedparser
-from pymongo import MongoClient, UpdateOne
+from flask import (
+    Flask, request, redirect, url_for, render_template_string,
+    make_response, abort, session, flash, jsonify
+)
+from pymongo import MongoClient
+from dateutil import parser as dateparser
+from bson import ObjectId
 
-# ---------- Configuration ----------
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# Optional content extraction
+try:
+    from readability import Document
+except Exception:
+    Document = None
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
+# ----------------- Environment -----------------
 MONGODB_URI = os.getenv(
     "MONGODB_URI",
     "mongodb+srv://yzhang850:a237342160@cluster0.cficuai.mongodb.net/?retryWrites=true&w=majority&authSource=admin"
 )
 DB_NAME = os.getenv("DB_NAME", "cti_platform")
+COLL_NAME = os.getenv("COLL_NAME", "threats")
+SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "dev-key")
 NVD_API_KEY = os.getenv("NVD_API_KEY", "").strip()
 
 ROLES = ["public", "pro", "admin"]
-ROLE_ORDER = {"public": 0, "pro": 1, "admin": 2}
-def roles_at_or_above(min_role: str):
-    """Return all roles whose level >= min_role."""
-    i = ROLE_ORDER.get(min_role, 0)
-    return [r for r in ROLES if ROLE_ORDER[r] >= i]
+ROLE_ORDER = {r: i for i, r in enumerate(ROLES)}
 
-# ---------- MongoDB ----------
-mongo = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=20000, connectTimeoutMS=20000)
-db = mongo[DB_NAME]
-coll = db["threats"]
-sources_coll = db["custom_sources"]
-try:
-    coll.create_index("source_id", unique=True)
-    coll.create_index([("timestamp", -1)])
-    coll.create_index([("allowed_roles", 1), ("timestamp", -1)])
-    sources_coll.create_index("url", unique=True)
-except Exception:
-    # Index creation is best-effort; ignore if already exists
-    pass
+# Sources (removed "user")
+ARTICLE_SOURCES = ["krebsonsecurity", "msrc_blog", "cisa_kev", "nvd", "exploitdb"]
 
-# ---------- Utilities ----------
-UA = {"User-Agent": "cti-crawler/1.0"}
+# Minimum role per built-in source
+SOURCE_ROLE = {
+    "krebsonsecurity": "public",
+    "msrc_blog": "public",
+    "cisa_kev": "pro",
+    "nvd": "admin",
+    "exploitdb": "admin",
+}
+
+SOURCE_STYLE = {
+    "krebsonsecurity": {"name": "KrebsOnSecurity", "badge": "success", "icon": "🕵️"},
+    "msrc_blog":       {"name": "MSRC Blog",       "badge": "primary", "icon": "🛡"},
+    "cisa_kev":        {"name": "CISA KEV",        "badge": "warning", "icon": "⚠️"},
+    "nvd":             {"name": "NVD (CVE)",       "badge": "danger",  "icon": "📊"},
+    "exploitdb":       {"name": "Exploit-DB",      "badge": "dark",    "icon": "💥"},
+}
+
+# ----------------- Flask & Mongo -----------------
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+mongo = MongoClient(MONGODB_URI)
+coll = mongo[DB_NAME][COLL_NAME]
+sources_coll = mongo[DB_NAME]["custom_sources"]
+users_coll = mongo[DB_NAME]["users"]
+# New isolated collections for per-user RSS
+user_rss_sources_coll = mongo[DB_NAME]["user_rss_sources"]
+user_rss_items_coll   = mongo[DB_NAME]["user_rss_items"]
+
+# ----------------- Utilities -----------------
+def parse_dt(s):
+    if not s: return None
+    try: return dateparser.parse(s)
+    except Exception: return None
+
+def role_allows(current_role: str, min_role: str) -> bool:
+    return ROLE_ORDER.get(current_role, 0) >= ROLE_ORDER.get(min_role, 0)
+
+def fmt_ts(ts, fmt="%Y-%m-%d %H:%M:%S"):
+    if not ts: return ""
+    if isinstance(ts, datetime): return ts.strftime(fmt)
+    if isinstance(ts, str):
+        try:
+            dt = dateparser.parse(ts); return dt.strftime(fmt) if dt else ""
+        except Exception: return ts
+    return ""
+
 CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.I)
+def extract_cves_from_text(txt: str):
+    if not txt: return []
+    return sorted(set(m.upper() for m in CVE_RE.findall(txt)))
 
-def clean_text(s: str | None) -> str:
-    """Decode HTML entities and collapse whitespace."""
-    if not s:
-        return ""
-    s = html.unescape(s)
-    return re.sub(r"\s+", " ", s).strip()
+def brief_for_public(text: str, length=200):
+    if not text: return ""
+    t = re.sub(r"<[^>]+>", " ", text)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:length] + ("…" if len(t) > length else "")
 
-def extract_cves(s: str | None):
-    """Extract unique CVE IDs from a string."""
-    if not s:
-        return []
-    return sorted(set(m.upper() for m in CVE_RE.findall(s)))
+def threat_points_for_pro(text: str):
+    if not text: return ""
+    body = re.sub(r"<[^>]+>", " ", text)
+    body = re.sub(r"\s+", " ", body)
+    sentences = re.split(r"(?<=[。.!?])\s+", body)
+    SIGNALS = ("critical", "remote execution", "RCE", "exploit", "zero-day",
+               "in the wild", "privilege escalation", "bypass", "vulnerability", "attack")
+    picked = [s for s in sentences if any(k.lower() in s.lower() for k in SIGNALS)]
+    if not picked and sentences: picked = sentences[:2]
+    return " ".join(picked[:2])
 
-# ====== Common: sentence splitting / denoising / summarization ======
-_SENT_SPLIT = re.compile(r"(?<=[。！？!?\.])\s+")
-_ONLY_PUNCT = re.compile(r"^\W+$")
-_BRACE_NOISE = re.compile(r"[\{\}\(\)\[\]\|\/\\]{3,}")
-_JS_SNIPPET  = re.compile(r"(?:^|[\s;])!?\s*function\s*\(", re.I)
-_MULTI_SPACE = re.compile(r"\s{2,}")
-_BRAND_TAIL  = re.compile(r"\s*\|\s*MSRC\s*Blog\s*\|\s*Microsoft\s*Security\s*Response\s*Center.*$", re.I)
-
-def _strip_noise(text: str) -> str:
+def extract_main_content(html: str):
+    title = ""; text = ""
+    if Document:
+        try:
+            doc = Document(html)
+            title = (doc.short_title() or "").strip()
+            summary_html = doc.summary()
+            text = re.sub(r"<[^>]+>", " ", summary_html or "")
+        except Exception:
+            pass
+    if not text and BeautifulSoup:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            article = soup.find("article") or soup
+            paras = [p.get_text(" ", strip=True) for p in article.find_all("p")]
+            text = " ".join(paras).strip()
+            if not title and soup.title and soup.title.string:
+                title = soup.title.string.strip()
+        except Exception:
+            pass
     if not text:
-        return ""
-    text = _BRACE_NOISE.sub(" ", text)
-    text = _MULTI_SPACE.sub(" ", text)
-    return text.strip()
-
-def _is_human_line(t: str) -> bool:
-    """Heuristics to drop nav/cookie/boilerplate lines."""
-    if not t or len(t) < 6:
-        return False
-    if _ONLY_PUNCT.match(t):
-        return False
-    if _BRACE_NOISE.search(t):
-        return False
-    if _JS_SNIPPET.search(t):
-        return False
-    low = t.lower()
-    for k in (
-        "cookie", "privacy", "terms", "navigation", "skip to content",
-        "microsoft security response center", "msrc blog", "rss", "search"
-    ):
-        if k in low:
-            return False
-    return True
-
-def _brand_tail_cut(s: str) -> str:
-    """Remove brand/site suffixes from titles."""
-    return _BRAND_TAIL.sub("", s or "").strip()
-
-def _first_good_sentences(text: str, max_sents: int = 3) -> str:
-    """Pick the first few human-looking sentences."""
-    sents = [s.strip() for s in _SENT_SPLIT.split(text) if s.strip()]
-    good = [s for s in sents if _is_human_line(s)]
-    return " ".join(good[:max_sents]) if good else (sents[0] if sents else "")
-
-def make_summary(text: str, max_chars: int = 260, max_sents: int = 3) -> str:
-    """Short extractive summary from denoised content."""
-    text = _strip_noise(clean_text(text))
-    if not text:
-        return ""
-    brief = _first_good_sentences(text, max_sents=max_sents) or text
-    if len(brief) > max_chars:
-        brief = brief[:max_chars].rstrip() + "..."
-    return brief
-
-# ====== Generic main-content extraction (includes MSRC .blog-post-content) ======
-def extract_main_content(html_doc: str) -> tuple[str, str]:
-    """
-    Returns (title, text_without_scripts):
-    - Use readability to get the main article area
-    - Prefer paragraph/list text from common containers (incl. .blog-post-content)
-    - Line-level denoising
-    """
-    title, text = "", ""
-    try:
-        from readability import Document
-        from bs4 import BeautifulSoup
-
-        doc = Document(html_doc)
-        title = clean_text(doc.short_title() or "")
-        summary_html = doc.summary(html_partial=True)
-        soup = BeautifulSoup(summary_html, "html.parser")
-
-        for tag in soup(["script", "style", "noscript", "template"]):
-            tag.decompose()
-
-        containers = []
-        for sel in [
-            "article", "main", ".entry-content", ".post-content",
-            ".article-content", ".content", "#content", ".post-body",
-            ".blog-post-content"  # MSRC
-        ]:
-            containers.extend(soup.select(sel))
-
-        lines = []
-        def push_lines(node):
-            for p in node.select("p, li"):
-                t = clean_text(p.get_text(" "))
-                t = _brand_tail_cut(_strip_noise(t))
-                if _is_human_line(t):
-                    lines.append(t)
-
-        if containers:
-            for c in containers:
-                push_lines(c)
-
-        if not lines:
-            all_text = clean_text(soup.get_text(" "))
-            all_text = _brand_tail_cut(_strip_noise(all_text))
-            primer = _first_good_sentences(all_text, max_sents=6)
-            lines = [primer] if primer else []
-
-        text = " ".join(lines)
-        text = _strip_noise(text)
-
-        if not title:
-            soup2 = BeautifulSoup(html_doc, "html.parser")
-            t = soup2.find("title")
-            if t:
-                title = clean_text(t.get_text())
-        title = _brand_tail_cut(title)
-
-    except Exception:
-        title = ""
-        text = clean_text(re.sub("<[^>]+>", " ", html_doc))
-        text = _brand_tail_cut(_strip_noise(text))
-
+        text = re.sub(r"<[^>]+>", " ", html or "")
+    text = re.sub(r"\s+", " ", text).strip()
     return title, text
 
-# ====== MSRC-specific body extraction (no title) ======
-def extract_msrc_body(html_doc: str) -> str:
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html_doc, "html.parser")
+# ----------------- Current user / auth helpers -----------------
+def get_current_user():
+    uid = session.get("uid")
+    if not uid:
+        return None
+    try:
+        return users_coll.find_one({"_id": ObjectId(uid)})
+    except Exception:
+        return None
 
-    box = soup.select_one("div.blog-post-content")
-    paras = []
-    if box:
-        for p in box.select("p"):
-            t = clean_text(p.get_text(" "))
-            t = _brand_tail_cut(_strip_noise(t))
-            if _is_human_line(t):
-                paras.append(t)
-    raw = " ".join(paras[:3]).strip()
-    if not raw:
-        # Fallback to generic extraction
-        _, full = extract_main_content(html_doc)
-        raw = full
-    return raw
+def current_user_id():
+    u = get_current_user()
+    return u["_id"] if u else None
 
-    
-# ====== Single RSS fetch (for immediate run after adding) ======
-def crawl_user_rss_one(feed_url: str, max_items_per_feed: int = 40, timeout: int = 25):
-    """
-    Crawl one specific RSS feed URL that already exists in custom_sources.
-    Returns a list of docs ready for upsert_many().
-    Also updates last_crawled / last_status on sources_coll for this URL.
-    """
-    logging.info("[user_rss_one] %s", feed_url)
-    now = datetime.now(timezone.utc)
-    rcd = sources_coll.find_one({"url": feed_url})
-    if not rcd:
-        logging.warning("[user_rss_one] not found in custom_sources: %s", feed_url)
-        return []
+def current_username():
+    u = get_current_user()
+    return u["username"] if u else None
 
-    role = (rcd.get("min_role") or "public").lower()
+def current_role() -> str:
+    u = get_current_user()
+    return u["role"] if u and u.get("role") in ROLES else "public"
+
+def login_required(view):
+    @wraps(view)
+    def _wrapped(*args, **kwargs):
+        if not get_current_user():
+            return redirect(url_for("auth_login_get", next=request.path))
+        return view(*args, **kwargs)
+    return _wrapped
+
+@app.context_processor
+def inject_helpers():
+    return dict(
+        SOURCE_STYLE=SOURCE_STYLE,
+        extract_cves_from_text=extract_cves_from_text,
+        brief_for_public=brief_for_public,
+        threat_points_for_pro=threat_points_for_pro,
+        fmt_ts=fmt_ts,
+        current_user=get_current_user(),
+        ROLES=ROLES
+    )
+
+# ----------------- NVD API (for /cve/<id>) -----------------
+NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+def _nvd_headers():
+    h = {"User-Agent": "cti-portal/1.0"}
+    if NVD_API_KEY: h["apiKey"] = NVD_API_KEY
+    return h
+
+@lru_cache(maxsize=256)
+def nvd_get_cve_raw(cve_id: str):
+    r = requests.get(NVD_API, params={"cveId": cve_id}, headers=_nvd_headers(), timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def nvd_parse_summary(nvd_json: dict):
+    vulns = (nvd_json or {}).get("vulnerabilities") or []
+    if not vulns: return {}
+    cve = vulns[0].get("cve") or {}
+    descriptions = cve.get("descriptions") or []
+    desc = ""
+    for d in descriptions:
+        if d.get("lang") == "en":
+            desc = d.get("value","")
+            break
+    metrics = cve.get("metrics") or {}
+    cvss = {}
+    for key in ("cvssMetricV31","cvssMetricV30","cvssMetricV2"):
+        if metrics.get(key):
+            m = metrics[key][0]; data = m.get("cvssData", {})
+            cvss = {
+                "version": data.get("version"),
+                "baseScore": data.get("baseScore"),
+                "baseSeverity": m.get("baseSeverity"),
+                "vectorString": data.get("vectorString"),
+                "exploitabilityScore": m.get("exploitabilityScore"),
+                "impactScore": m.get("impactScore"),
+            }
+            break
+    weaknesses = []
+    for w in (cve.get("weaknesses") or []):
+        for d in (w.get("description") or []):
+            if d.get("value"): weaknesses.append(d["value"])
+    weaknesses = sorted(set(weaknesses))
+    refs = []
+    for r in (cve.get("references") or []):
+        refs.append({"url": r.get("url"), "tags": r.get("tags") or []})
+    return {"id": cve.get("id"), "description": desc, "cvss": cvss, "weaknesses": weaknesses, "references": refs}
+
+# ----------------- Auth: login / register / logout -----------------
+@app.get("/auth/login")
+def auth_login_get():
+    return render_template_string(TPL_AUTH, mode="login", next=request.args.get("next") or "")
+
+@app.post("/auth/login")
+def auth_login_post():
+    username = (request.form.get("username") or "").strip()
+    password = (request.form.get("password") or "").strip()
+    next_url = (request.form.get("next") or "").strip() or url_for("feed")
+    u = users_coll.find_one({"username": username})
+    if not u or not check_password_hash(u.get("password",""), password):
+        flash("Invalid username or password", "danger")
+        return render_template_string(TPL_AUTH, mode="login", next=next_url)
+    session["uid"] = str(u["_id"])
+    return redirect(next_url)
+
+@app.get("/auth/register")
+def auth_register_get():
+    return render_template_string(TPL_AUTH, mode="register", next=request.args.get("next") or "")
+
+@app.post("/auth/register")
+def auth_register_post():
+    username = (request.form.get("username") or "").strip()
+    password = (request.form.get("password") or "").strip()
+    role = (request.form.get("role") or "public").strip()
+    next_url = (request.form.get("next") or "").strip() or url_for("feed")
     if role not in ROLES:
         role = "public"
+    if not username or not password:
+        flash("Please enter username and password", "warning")
+        return render_template_string(TPL_AUTH, mode="register", next=next_url)
+    if users_coll.find_one({"username": username}):
+        flash("Username already exists", "warning")
+        return render_template_string(TPL_AUTH, mode="register", next=next_url)
 
-    docs = []
-    try:
-        feed = parse_feed_with_backoff(feed_url)
-        cnt = 0
-        for e in feed.entries:
-            if cnt >= max_items_per_feed:
-                break
-            link = (getattr(e, "link", "") or "").strip()
-            if not link or not link.startswith(("http://", "https://")):
-                continue
-
-            try:
-                resp = http_get(link, timeout=timeout, headers=UA)
-                resp.raise_for_status()
-                _, full = extract_main_content(resp.text)
-                title = clean_text(getattr(e, "title", "") or link)
-                content = make_summary(full, max_chars=260)
-            except Exception:
-                title = clean_text(getattr(e, "title", "") or link)
-                raw = clean_text(getattr(e, "summary", "") or getattr(e, "description", "") or "")
-                content = make_summary(raw, max_chars=260)
-
-            ts = _entry_datetime(e)
-            docs.append({
-                "source": "user",
-                "source_id": f"user:{hashlib.sha1(link.encode()).hexdigest()}",
-                "title": title or link,
-                "url": link,
-                "content": content,
-                "timestamp": ts,
-                "min_role": role,
-                "allowed_roles": roles_at_or_above(role),
-                "origin": urlparse(link).netloc,
-            })
-            cnt += 1
-
-        sources_coll.update_one(
-            {"_id": rcd["_id"]},
-            {"$set": {"last_crawled": now, "last_status": f"ok:{cnt}", "updated_at": now}}
-        )
-        logging.info("[user_rss_one] %s -> %d items", feed_url, cnt)
-    except Exception as e:
-        logging.warning("[user_rss_one] fail %s: %s", feed_url, e)
-        sources_coll.update_one(
-            {"_id": rcd["_id"]},
-            {"$set": {"last_crawled": now, "last_status": f"error:{e.__class__.__name__}", "updated_at": now}}
-        )
-    return docs
-
-
-def fetch_and_upsert_user_rss_one(feed_url: str, max_items_per_feed: int = 40):
-    """
-    Helper: crawl one RSS and upsert into Mongo.
-    Returns (inserted_count, total_docs).
-    """
-    docs = crawl_user_rss_one(feed_url, max_items_per_feed=max_items_per_feed)
-    ins, _ = upsert_many(docs)
-    return ins, len(docs)
-
-
-# ====== KrebsOnSecurity-specific body extraction (no title) ======
-def extract_krebs_body(html_doc: str) -> str:
-    """
-    Pull a few paragraphs from #content.site-content (or #primary.site-content) article,
-    dropping WordPress emoji init noise.
-    """
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html_doc, "html.parser")
-
-    container = soup.select_one("#content.site-content article") or \
-                soup.select_one("#primary.site-content article")
-
-    ban_substr = ("wpemojiSettings", "s.w.org/images/core/emoji", "SVGAnimated")
-    paras = []
-    if container:
-        for p in container.select("p"):
-            t = clean_text(p.get_text(" "))
-            if any(b in t for b in ban_substr):
-                continue
-            t = _strip_noise(t)
-            if _is_human_line(t):
-                paras.append(t)
-
-    raw = " ".join(paras[:3]).strip()
-    if not raw:
-        # Fallback to generic extraction
-        _, full = extract_main_content(html_doc)
-        raw = full
-    return raw
-
-# ====== MongoDB bulk upsert ======
-def upsert_many(docs):
-    """Bulk upsert by source_id. Returns (inserted_count, matched_count)."""
-    if not docs:
-        return (0, 0)
-    ops = []
-    for d in docs:
-        ops.append(UpdateOne(
-            {"source_id": d["source_id"]},
-            {"$setOnInsert": {"source_id": d["source_id"], "source": d.get("source")},
-             "$set": {k: v for k, v in d.items() if k not in ("source_id", "source")}},
-            upsert=True
-        ))
-    try:
-        res = coll.bulk_write(ops, ordered=False)
-        ins = getattr(res, "upserted_count", 0)
-        return ins, len(ops) - ins
-    except Exception as e:
-        logging.error("Mongo bulk_write error: %s", e)
-        return (0, 0)
-
-def _entry_datetime(e):
-    """Build a timezone-aware datetime from feed entry, fallback to now."""
-    try:
-        if getattr(e, "published_parsed", None):
-            return datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-        if getattr(e, "updated_parsed", None):
-            return datetime(*e.updated_parsed[:6], tzinfo=timezone.utc)
-    except Exception:
-        pass
-    return datetime.now(timezone.utc)
-
-def _iso8601_z(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-# ---------- Site crawlers ----------
-
-def crawl_cisa_kev(limit=2000):
-    logging.info("[cisa_kev] min_role=pro limit=%d", limit)
-    urls = [
-        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
-        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.csv.json",
-    ]
-    docs, now = [], datetime.now(timezone.utc)
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=30, headers=UA)
-            r.raise_for_status()
-            data = r.json()
-            vulns = data.get("vulnerabilities") or []
-            for v in vulns[:limit]:
-                cve = v.get("cveID") or v.get("cve") or v.get("cveId")
-                if not cve:
-                    continue
-                title = f"{cve} - {v.get('vendorProject','')}/{v.get('product','')}"
-                desc = v.get("shortDescription") or v.get("description") or ""
-                page_url = "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
-                docs.append({
-                    "source": "cisa_kev",
-                    "source_id": f"cisa_kev:{cve}",
-                    "title": clean_text(title),
-                    "url": page_url,
-                    "content": make_summary(desc, max_chars=240),
-                    "timestamp": now,
-                    "min_role": "pro",
-                    "allowed_roles": roles_at_or_above("pro"),
-                    "origin": "cisa.gov",
-                })
-            break
-        except Exception as e:
-            logging.warning("[cisa_kev] fetch fail from %s: %s", url, e)
-            continue
-    return docs
-
-def crawl_krebsonsecurity(limit=40):
-    logging.info("[krebsonsecurity] min_role=public limit=%d", limit)
-    feed_url = "https://krebsonsecurity.com/feed/"
-    docs = []
-    try:
-        feed = feedparser.parse(feed_url)
-        for e in feed.entries[:limit]:
-            link = (getattr(e, "link", "") or "").strip()
-            if not link:
-                continue
-            try:
-                r = requests.get(link, timeout=25, headers=UA)
-                r.raise_for_status()
-                # Krebs: summary from body paragraphs only (no title mixed in)
-                raw = extract_krebs_body(r.text)
-                title = clean_text(getattr(e, "title", "") or link)
-                content = make_summary(raw, max_chars=260)
-            except Exception:
-                title = clean_text(getattr(e, "title", "") or link)
-                raw = clean_text(getattr(e, "summary", "") or "")
-                content = make_summary(raw, max_chars=260)
-            docs.append({
-                "source": "krebsonsecurity",
-                "source_id": f"krebsonsecurity:{hashlib.sha1(link.encode()).hexdigest()}",
-                "title": title or link,
-                "url": link,
-                "content": content,
-                "timestamp": datetime.now(timezone.utc),
-                "min_role": "public",
-                "allowed_roles": roles_at_or_above("public"),
-                "origin": urlparse(link).netloc,
-            })
-    except Exception as e:
-        logging.error("[krebsonsecurity] error: %s", e)
-    return docs
-
-def crawl_msrc_blog(limit=40):
-    logging.info("[msrc_blog] min_role=public limit=%d", limit)
-    feed_url = "https://msrc.microsoft.com/blog/feed/"
-    docs = []
-    try:
-        feed = feedparser.parse(feed_url)
-        for e in feed.entries[:limit]:
-            link = (getattr(e, "link", "") or "").strip()
-            if not link:
-                continue
-            try:
-                r = requests.get(link, timeout=25, headers=UA)
-                r.raise_for_status()
-                raw = extract_msrc_body(r.text)  # Only body text (no title)
-                # Title from RSS or <title>, but do not prepend to summary
-                title = clean_text(getattr(e, "title", "") or "") or _brand_tail_cut(clean_text(r.text))
-                content = make_summary(raw, max_chars=260, max_sents=3)
-                if not title:
-                    title = link
-            except Exception:
-                title = clean_text(getattr(e, "title", "") or link)
-                raw = clean_text(getattr(e, "summary", "") or getattr(e, "description", "") or "")
-                content = make_summary(raw, max_chars=260, max_sents=3)
-
-            docs.append({
-                "source": "msrc_blog",
-                "source_id": f"msrc_blog:{hashlib.sha1(link.encode()).hexdigest()}",
-                "title": title or link,
-                "url": link,
-                "content": content,
-                "timestamp": datetime.now(timezone.utc),
-                "min_role": "public",
-                "allowed_roles": roles_at_or_above("public"),
-                "origin": urlparse(link).netloc,
-            })
-    except Exception as e:
-        logging.error("[msrc_blog] error: %s", e)
-    return docs
-
-def crawl_threatfox(limit=600, days=3, timeout=30):
-    """
-    Pull recent IOCs from ThreatFox official API.
-    Docs: https://threatfox.abuse.ch/api/
-    - query: get_iocs
-    - days: 1..7 (based on first_seen)  [default 3]
-    - limit: API enforces caps; we further cap client-side [default 600]
-    Stored fields:
-      indicator, ioc_type, malware, actor, confidence, tags, related_cves
-    Visibility:
-      min_role='pro', allowed_roles=roles_at_or_above('pro')
-    """
-    logging.info("[threatfox] using API min_role=pro days=%d limit=%d", days, limit)
-
-    url = "https://threatfox.abuse.ch/api/"
-    headers = {"User-Agent": "cti-crawler/1.0", "Content-Type": "application/json"}
-    payload = {"query": "get_iocs", "days": max(1, min(7, int(days))), "limit": int(limit)}
-
-    docs = []
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=timeout)
-        r.raise_for_status()
-        data = r.json() if r.headers.get("content-type","").lower().startswith("application/json") else {}
-        iocs = data.get("data") or []  # list of IOC dicts
-        if not iocs:
-            logging.info("[threatfox] API returned no data.")
-            return []
-
-        # Normalize & map fields
-        for row in iocs[:limit]:
-            # API fields (see docs): ioc, ioc_type, malware, malware_printable, threat_type,
-            # confidence_level, first_seen, last_seen, tags (list), reference, reporter, ...
-            indicator = row.get("ioc") or ""
-            ioc_type = (row.get("ioc_type") or "").upper() or None
-            malware = row.get("malware_printable") or row.get("malware") or None
-            actor = row.get("threat_actor") or row.get("actor") or None
-            # ThreatFox uses 'confidence_level' 0..100
-            confidence = None
-            try:
-                v = row.get("confidence_level")
-                if v is not None:
-                    confidence = max(0, min(100, int(v)))
-            except Exception:
-                confidence = None
-            tags = row.get("tags") or []
-            if isinstance(tags, str):
-                tags = [t.strip() for t in re.split(r"[,\s]+", tags) if t.strip()]
-
-            # Build title/content
-            title_bits = [ioc_type or "IOC", indicator]
-            if malware: title_bits.append(f"[{malware}]")
-            title = " ".join([b for b in title_bits if b])
-            summary_src = " ".join([
-                str(row.get("threat_type") or ""),
-                str(row.get("reference") or ""),
-                " ".join(tags) if tags else ""
-            ]).strip()
-            content = make_summary(summary_src or title, max_chars=260)
-
-            # Timestamps
-            ts_str = row.get("first_seen") or row.get("last_seen")
-            try:
-                # ThreatFox ISO is like "2025-08-18 12:34:56 UTC" or ISO8601
-                ts_str2 = ts_str.replace(" UTC", "+00:00") if isinstance(ts_str, str) else None
-                ts = datetime.fromisoformat(ts_str2) if ts_str2 and "T" in ts_str2 else datetime.now(timezone.utc)
-            except Exception:
-                ts = datetime.now(timezone.utc)
-
-            related_cves = extract_cves(" ".join([title, content, malware or "", " ".join(tags)]))
-
-            link = row.get("reference") or "https://threatfox.abuse.ch/"
-            source_id = f"threatfox:{hashlib.sha1((indicator or link or title).encode()).hexdigest()}"
-
-            docs.append({
-                "source": "threatfox",
-                "source_id": source_id,
-                "title": title or "ThreatFox IOC",
-                "url": link,
-                "content": content,
-                "timestamp": ts,
-                "min_role": "pro",
-                "allowed_roles": roles_at_or_above("pro"),
-                "origin": urlparse(link).netloc or "threatfox.abuse.ch",
-
-                # IOC-centric fields for UI
-                "indicator": indicator or None,
-                "ioc_type": ioc_type,
-                "malware": malware,
-                "actor": actor,
-                "confidence": confidence,
-                "tags": tags[:16],
-                "related_cves": related_cves,
-            })
-        return docs
-
-    except Exception as e:
-        logging.error("[threatfox] API error: %s", e)
-        return []
-
-
-
-# ---------- NVD & Exploit-DB ----------
-def crawl_nvd_recent(days=7, max_items=200):
-    logging.info("[nvd] min_role=admin days=%d max=%d", days, max_items)
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days)
-    params = {
-        "pubStartDate": _iso8601_z(start),
-        "pubEndDate": _iso8601_z(end),
-        "resultsPerPage": min(2000, max_items),
-        "startIndex": 0,
+    u = {
+        "username": username,
+        "password": generate_password_hash(password),
+        "role": role,
+        "created_at": datetime.now(timezone.utc)
     }
-    headers = {"User-Agent": "cti-crawler/1.0"}
-    if NVD_API_KEY:
-        headers["apiKey"] = NVD_API_KEY
+    r = users_coll.insert_one(u)
+    session["uid"] = str(r.inserted_id)
+    return redirect(next_url)
 
-    docs = []
-    try:
-        r = requests.get(
-            "https://services.nvd.nist.gov/rest/json/cves/2.0",
-            params=params, headers=headers, timeout=30
+@app.get("/auth/logout")
+def auth_logout():
+    session.pop("uid", None)
+    return redirect(url_for("auth_login_get"))
+
+# ----------------- Routes -----------------
+@app.route("/")
+def index():
+    return redirect(url_for("feed"))
+
+# Feed (login required) + RSS manager (username-bound)
+@app.route("/feed")
+@login_required
+def feed():
+    role = current_role()
+    owner_name = current_username()
+    q = (request.args.get("q") or "").strip()
+    since = parse_dt(request.args.get("since"))
+    until = parse_dt(request.args.get("until"))
+    page = max(1, int(request.args.get("page", 1)))
+    page_size = min(100, max(5, int(request.args.get("page_size", 20))))
+
+    # NEW: unified filter bar (["rss"] + built-ins)
+    all_filters = ["rss"] + ARTICLE_SOURCES
+    sel_sources = request.args.getlist("source")
+    if not sel_sources:
+        # default: show built-in sources (no RSS)
+        sel_sources = ARTICLE_SOURCES[:]
+
+    rss_mode = ("rss" in sel_sources) and (set(sel_sources) == {"rss"})
+
+    if rss_mode:
+        filt = {"owner_username": owner_name}
+        if q:
+            filt["$or"] = [
+                {"title": {"$regex": q, "$options": "i"}},
+                {"content": {"$regex": q, "$options": "i"}},
+            ]
+        if since or until:
+            rng = {}
+            if since: rng["$gte"] = since
+            if until: rng["$lte"] = until
+            filt["timestamp"] = rng
+
+        total = user_rss_items_coll.count_documents(filt)
+        items = list(
+            user_rss_items_coll.find(
+                filt,
+                {"title":1,"url":1,"content":1,"timestamp":1,"feed_url":1}
+            )
+            .sort([("timestamp", -1)])
+            .skip((page - 1) * page_size)
+            .limit(page_size)
         )
-        r.raise_for_status()
-        data = r.json()
-        vulns = data.get("vulnerabilities") or []
-        for v in vulns[:max_items]:
-            cve = (v.get("cve") or {})
-            cve_id = cve.get("id")
-            if not cve_id:
-                continue
+    else:
+        # Only keep valid built-in sources and enforce role
+        req_sources = [s for s in sel_sources if s in ARTICLE_SOURCES]
+        allowed_sources = [s for s in req_sources if role_allows(role, SOURCE_ROLE.get(s, "public"))]
 
-            desc = ""
-            for d in (cve.get("descriptions") or []):
-                if d.get("lang") == "en":
-                    desc = d.get("value", "")
-                    break
+        items = []; total = 0
+        if allowed_sources:
+            branch = {"source": {"$in": allowed_sources}, "allowed_roles": role}
+            if q:
+                branch["$or"] = [
+                    {"title": {"$regex": q, "$options": "i"}},
+                    {"content": {"$regex": q, "$options": "i"}},
+                ]
+            if since or until:
+                rng = {}
+                if since: rng["$gte"] = since
+                if until: rng["$lte"] = until
+                branch["timestamp"] = rng
 
-            metrics = cve.get("metrics") or {}
-            cvss = None
-            for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
-                if metrics.get(key):
-                    m = metrics[key][0]
-                    data_cvss = m.get("cvssData", {})
-                    cvss = {
-                        "version": data_cvss.get("version"),
-                        "baseScore": data_cvss.get("baseScore"),
-                        "baseSeverity": m.get("baseSeverity"),
-                        "vectorString": data_cvss.get("vectorString"),
-                        "exploitabilityScore": m.get("exploitabilityScore"),
-                        "impactScore": m.get("impactScore"),
+            filt = branch
+            total = coll.count_documents(filt)
+            items = list(
+                coll.find(
+                    filt,
+                    {
+                        "title":1,"url":1,"content":1,"timestamp":1,"source":1,"min_role":1,
+                        "nvd_cvss":1,"nvd_cwes":1,"nvd_refs":1,
+                        "edb_id":1,"edb_cves":1,
+                        "recommendations.cybok": 1,
                     }
-                    break
-
-            weaknesses = []
-            for w in (cve.get("weaknesses") or []):
-                for dsc in (w.get("description") or []):
-                    val = dsc.get("value")
-                    if val:
-                        weaknesses.append(val)
-            weaknesses = sorted(set(weaknesses))
-
-            refs = []
-            for rr in (cve.get("references") or []):
-                url = rr.get("url")
-                if url:
-                    refs.append(url)
-
-            ts_str = cve.get("published") or cve.get("lastModified")
-            try:
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            except Exception:
-                ts = end
-
-            docs.append({
-                "source": "nvd",
-                "source_id": f"nvd:{cve_id}",
-                "title": f"{cve_id} - {clean_text(desc)[:120]}",
-                "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
-                "content": make_summary(desc, max_chars=260),
-                "timestamp": ts,
-                "min_role": "admin",
-                "allowed_roles": roles_at_or_above("admin"),
-                "origin": "nvd.nist.gov",
-                "nvd_cvss": cvss,
-                "nvd_cwes": weaknesses,
-                "nvd_refs": refs[:10],
-            })
-    except Exception as e:
-        logging.error("[nvd] error: %s", e)
-    return docs
-
-def crawl_exploitdb(limit=60):
-    logging.info("[exploitdb] min_role=admin limit=%d", limit)
-    feed_url = "https://www.exploit-db.com/rss.xml"
-    docs = []
-    try:
-        feed = feedparser.parse(feed_url)
-        for e in feed.entries[:limit]:
-            link = (getattr(e, "link", "") or "").strip()
-            if not link:
-                continue
-            m = re.search(r"/exploits/(\d+)", link)
-            edb_id = m.group(1) if m else None
-
-            title = clean_text(getattr(e, "title", "") or link)
-            summary = clean_text(getattr(e, "summary", "") or getattr(e, "description", "") or "")
-            cves = extract_cves(title + " " + summary)
-
-            docs.append({
-                "source": "exploitdb",
-                "source_id": f"exploitdb:{edb_id or hashlib.sha1(link.encode()).hexdigest()}",
-                "title": title,
-                "url": link,
-                "content": make_summary(summary, max_chars=260),
-                "timestamp": _entry_datetime(e),
-                "min_role": "admin",
-                "allowed_roles": roles_at_or_above("admin"),
-                "origin": urlparse(link).netloc,
-                "edb_id": edb_id,
-                "edb_cves": cves,
-            })
-    except Exception as e:
-        logging.error("[exploitdb] error: %s", e)
-    return docs
-
-# ---------- User-defined RSS ----------
-def crawl_user_rss(limit_sources=200, max_items_per_feed=40, timeout=25):
-    logging.info("[user_rss] crawling enabled RSS sources (deferred)")
-    recs = list(sources_coll.find({"enabled": True, "mode": "rss"})
-                .sort([("updated_at", -1)]).limit(limit_sources))
-    docs, now = [], datetime.now(timezone.utc)
-
-    for rcd in recs:
-        feed_url = rcd.get("url")
-        role = (rcd.get("min_role") or "public").lower()
-        if role not in ROLES:
-            role = "public"
-        try:
-            feed = feedparser.parse(feed_url)
-            cnt = 0
-            for e in feed.entries:
-                if cnt >= max_items_per_feed:
-                    break
-                link = (getattr(e, "link", "") or "").strip()
-                if not link or not link.startswith(("http://", "https://")):
-                    continue
-
-                try:
-                    resp = requests.get(link, timeout=timeout, headers=UA)
-                    resp.raise_for_status()
-                    # Generic main-body -> summary (do not prepend the title)
-                    _, full = extract_main_content(resp.text)
-                    title = clean_text(getattr(e, "title", "") or link)
-                    content = make_summary(full, max_chars=260)
-                except Exception:
-                    title = clean_text(getattr(e, "title", "") or link)
-                    raw = clean_text(getattr(e, "summary", "") or getattr(e, "description", "") or "")
-                    content = make_summary(raw, max_chars=260)
-
-                ts = _entry_datetime(e)
-                docs.append({
-                    "source": "user",
-                    "source_id": f"user:{hashlib.sha1(link.encode()).hexdigest()}",
-                    "title": title or link,
-                    "url": link,
-                    "content": content,
-                    "timestamp": ts,
-                    "min_role": role,
-                    "allowed_roles": roles_at_or_above(role),
-                    "origin": urlparse(link).netloc,
-                })
-                cnt += 1
-
-            sources_coll.update_one(
-                {"_id": rcd["_id"]},
-                {"$set": {"last_crawled": now, "last_status": f"ok:{cnt}"}}
+                )
+                .sort([("timestamp", -1)])
+                .skip((page - 1) * page_size)
+                .limit(page_size)
             )
-            logging.info("[user_rss] %s -> %d items", feed_url, cnt)
-        except Exception as e:
-            logging.warning("[user_rss] fail %s: %s", feed_url, e)
-            sources_coll.update_one(
-                {"_id": rcd["_id"]},
-                {"$set": {"last_crawled": now, "last_status": f"error:{e.__class__.__name__}"}}
-            )
-    return docs
 
-# ---------- Main entry ----------
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    pages = max(1, math.ceil(total / page_size))
+    pager = {"total": total, "page": page, "pages": pages,
+             "page_size": page_size, "has_prev": page > 1, "has_next": page < pages,
+             "prev": page - 1, "next": page + 1}
 
-    sites = [
-        ("cisa_kev", crawl_cisa_kev, {"limit": 2000}),
-        ("krebsonsecurity", crawl_krebsonsecurity, {"limit": 40}),
-        ("msrc_blog", crawl_msrc_blog, {"limit": 40}),
-        ("threatfox", crawl_threatfox, {"limit": 60}),
-        ("nvd", crawl_nvd_recent, {"days": 7, "max_items": 200}),
-        ("exploitdb", crawl_exploitdb, {"limit": 60}),
-    ]
-    logging.info("Sites to crawl: %s", [n for (n, _, _) in sites])
+    rss_list = list(
+        user_rss_sources_coll.find({"owner_username": owner_name}).sort([("updated_at", -1)])
+    )
 
-    for name, func, kwargs in sites:
-        try:
-            docs = func(**kwargs)
-            ins, _ = upsert_many(docs)
-            logging.info("[%s] saved: upserted=%d matched=%d", name, ins, len(docs) - ins)
-        except Exception as e:
-            logging.error("[%s] fatal: %s", name, e)
+    resp = make_response(render_template_string(
+        TPL_FEED,
+        items=items, pager=pager, q=q,
+        sources=sel_sources,
+        source_label={k: v["name"] for k, v in SOURCE_STYLE.items()},
+        all_sources=ARTICLE_SOURCES,
+        all_filters=all_filters,
+        rss_list=rss_list,
+        rss_mode=rss_mode
+    ))
+    return resp
 
+# --- enqueue fetch -> reco ---
+@app.post("/fetch_now")
+@login_required
+def fetch_now():
+    ar = run_fetch_and_reco.delay()
+    return jsonify({
+        "task_id": ar.id,
+        "state": ar.state
+    })
+
+# --- poll task status ---
+@app.get("/task_status/<task_id>")
+@login_required
+def task_status(task_id):
+    return jsonify(get_task_status(task_id))
+
+def get_task_status(task_id: str) -> dict:
+    ar = AsyncResult(task_id, app=celery)
+    payload = {"task_id": task_id, "state": ar.state}
+
+    if ar.state == "PENDING":
+        payload["meta"] = None
+    elif ar.state in {"RECEIVED", "STARTED", "PROGRESS"}:
+        payload["meta"] = _safe_info(ar.info)
+    elif ar.state == "FAILURE":
+        payload["meta"] = _safe_info(ar.info)
+        payload["traceback"] = ar.traceback
+    elif ar.state == "SUCCESS":
+        payload["result"] = _safe_info(ar.result)
+    return payload
+
+def _safe_info(val):
+    if isinstance(val, Exception):
+        return {"error": str(val)}
+    if isinstance(val, (dict, list, str, int, float, bool)) or val is None:
+        return val
+    return {"repr": repr(val)}
+
+# Item details
+@app.get("/item/<id>")
+@login_required
+def item_detail(id):
     try:
-        docs = crawl_user_rss(limit_sources=200, max_items_per_feed=40)
-        ins, _ = upsert_many(docs)
-        logging.info("[user_rss] saved: upserted=%d total=%d", ins, len(docs))
-    except Exception as e:
-        logging.error("[user_rss] fatal: %s", e)
+        oid = ObjectId(id)
+    except Exception:
+        abort(404)
+    doc = coll.find_one({"_id": oid})
+    if not doc:
+        abort(404)
+    st = SOURCE_STYLE.get(doc.get("source"), {"name": doc.get("source","Other"), "badge":"secondary", "icon":"📰"})
+    return render_template_string(TPL_ITEM, it=doc, st=st)
 
+# CVE details
+@app.get("/cve/<cve_id>")
+@login_required
+def cve_detail(cve_id):
+    role = current_role()
+    data = {}
+    try:
+        data = nvd_parse_summary(nvd_get_cve_raw(cve_id))
+    except Exception:
+        data = {}
+    return render_template_string(TPL_CVE, cve_id=cve_id, data=data, role=role)
+
+# CyBOK by sid
+@app.get("/cybok/<sid>")
+@login_required
+def cybok_view(sid):
+    cybok_coll = coll.database["cybok_sections"]
+    try:
+        oid = ObjectId(sid)
+    except Exception:
+        return render_template_string("""
+        <!doctype html><html><body>
+        <div style="padding:24px;font-family:sans-serif">
+          <h4>Invalid ID</h4>
+          <div>The provided sid is not a valid ObjectId: {{ sid }}</div>
+        </div></body></html>""", sid=sid), 400
+
+    doc = cybok_coll.find_one({"_id": oid})
+    if not doc:
+        return render_template_string("""
+        <!doctype html><html><body>
+        <div style="padding:24px;font-family:sans-serif">
+          <h4>Section Not Found</h4>
+          <div>Version mismatch or data not imported.</div>
+        </div></body></html>"""), 404
+
+    import html as _h, re as _r
+    title = _h.escape(doc.get("title") or "")
+    section = _h.escape(doc.get("section") or "")
+    content = doc.get("content") or ""
+    paras = [f"<p>{_h.escape(p.strip())}</p>" for p in _r.split(r"\n{2,}", content) if p.strip()]
+    body_html = "\n".join(paras) if paras else f"<pre class='text-secondary'>{_h.escape(content)}</pre>"
+
+    return render_template_string(r"""
+    <!doctype html>
+    <html lang="en"><head>
+      <meta charset="utf-8">
+      <title>CyBOK · {{ section }} {{ title }}</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+      <nav class="navbar navbar-expand-lg bg-white border-bottom">
+        <div class="container-fluid">
+          <a class="navbar-brand" href="{{ url_for('feed') }}">CTI Portal</a>
+          <span class="ms-2 text-muted">CyBOK</span>
+        </div>
+      </nav>
+      <div class="container py-4">
+        <h4 class="mb-1">{{ section }} · {{ title }}</h4>
+        <div class="card"><div class="card-body">{{ body|safe }}</div></div>
+      </div>
+    </body></html>
+    """, section=section, title=title, body=body_html)
+
+# CyBOK by title/section
+@app.get("/cybok/byref>")
+@login_required
+def cybok_byref():
+    title = (request.args.get("title") or "").strip()
+    section = (request.args.get("section") or "").strip()
+    version = (request.args.get("version") or "v1").strip()
+
+    if not title and not section:
+        return render_template_string("<div style='padding:24px'>Missing params: provide ?title or ?section</div>"), 400
+
+    cybok_coll = coll.database["cybok_sections"]
+
+    q = {"version": version}
+    if title:   q["title"] = title
+    if section: q["section"] = section
+    doc = cybok_coll.find_one(q)
+
+    if not doc:
+        q2 = {"version": version}
+        if title:
+            q2["title"] = {"$regex": re.escape(title), "$options": "i"}
+        if section:
+            q2["section"] = {"$regex": f"^{re.escape(section)}", "$options": "i"}
+        doc = cybok_coll.find_one(q2)
+
+    if not doc:
+        return render_template_string("<div style='padding:24px'>CyBOK section not found</div>"), 404
+
+    import html as _h, re as _r
+    safe_title = _h.escape(doc.get("title") or "")
+    safe_section = _h.escape(doc.get("section") or "")
+    content = doc.get("content") or ""
+    paras = [f"<p>{_h.escape(p.strip())}</p>" for p in _r.split(r"\n{2,}", content) if p.strip()]
+    body_html = "\n".join(paras) if paras else f"<pre class='text-secondary'>{_h.escape(content)}</pre>"
+
+    return render_template_string(r"""
+    <!doctype html>
+    <html lang="en"><head>
+      <meta charset="utf-8">
+      <title>CyBOK · {{ section }} {{ title }}</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+      <nav class="navbar navbar-expand-lg bg-white border-bottom">
+        <div class="container-fluid">
+          <a class="navbar-brand" href="{{ url_for('feed') }}">CTI Portal</a>
+          <span class="ms-2 text-muted">CyBOK</span>
+        </div>
+      </nav>
+      <div class="container py-4">
+        <h4 class="mb-1">{{ section }} · {{ title }}</h4>
+        <div class="card"><div class="card-body">{{ body|safe }}</div></div>
+      </div>
+    </body></html>
+    """, section=safe_section, title=safe_title, body=body_html)
+
+# ----------------- RSS management (username-bound) -----------------
+@app.post("/add_rss")
+@login_required
+def add_rss():
+    owner_name = current_username()
+    rss_url = (request.form.get("rss_url") or "").strip()
+    role_sel = (request.form.get("rss_role") or "public").strip().lower()
+    if role_sel not in ROLES:
+        role_sel = "public"
+    if not rss_url or not re.match(r"^https?://", rss_url, re.I):
+        flash("Invalid RSS URL.", "warning")
+        return redirect(url_for("feed"))
+
+    now = datetime.now(timezone.utc)
+    user_rss_sources_coll.update_one(
+        {"owner_username": owner_name, "url": rss_url},
+        {"$set": {
+            "owner_username": owner_name,
+            "url": rss_url,
+            "mode": "rss",
+            "min_role": role_sel,
+            "allowed_roles": [r for r in ROLES if ROLE_ORDER[r] >= ROLE_ORDER[role_sel]],
+            "enabled": True,
+            "updated_at": now,
+        }, "$setOnInsert": {
+            "created_at": now,
+            "last_crawled": None,
+            "last_status": None,
+        }},
+        upsert=True
+    )
+
+    ar = run_fetch_user_rss_once.delay(owner_name, rss_url, 200)
+    flash(f"RSS saved & initial fetch queued (task: {ar.id})", "success")
+    return redirect(url_for("feed"))
+
+@app.post("/sources/<sid>/toggle")
+@login_required
+def source_toggle(sid):
+    owner_name = current_username()
+    try:
+        oid = ObjectId(sid)
+    except Exception:
+        flash("Invalid source id.", "warning")
+        return redirect(url_for("feed"))
+    doc = user_rss_sources_coll.find_one({"_id": oid, "owner_username": owner_name})
+    if not doc:
+        flash("Source not found or no permission.", "warning")
+        return redirect(url_for("feed"))
+    new_enabled = not bool(doc.get("enabled", True))
+    user_rss_sources_coll.update_one({"_id": oid, "owner_username": owner_name}, {"$set": {"enabled": new_enabled, "updated_at": datetime.now(timezone.utc)}})
+    flash(("Enabled" if new_enabled else "Disabled") + " RSS source.", "info")
+    return redirect(url_for("feed"))
+
+@app.post("/sources/<sid>/delete")
+@login_required
+def source_delete(sid):
+    owner_name = current_username()
+    try:
+        oid = ObjectId(sid)
+    except Exception:
+        flash("Invalid source id.", "warning")
+        return redirect(url_for("feed"))
+    res = user_rss_sources_coll.delete_one({"_id": oid, "owner_username": owner_name})
+    if res.deleted_count == 0:
+        flash("Source not found or no permission.", "warning")
+    else:
+        flash("RSS source deleted.", "danger")
+    return redirect(url_for("feed"))
+
+# ----------------- Templates -----------------
+TPL_AUTH = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ 'Log in' if mode=='login' else 'Register' }} · CTI Portal</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+<div class="container py-5" style="max-width:480px">
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h4 class="mb-3">{{ 'Log in' if mode=='login' else 'Register' }}</h4>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for cat, msg in messages %}
+          <div class="alert alert-{{ cat }} py-2">{{ msg }}</div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      {% if mode=='login' %}
+      <form method="post" action="{{ url_for('auth_login_post') }}">
+        <input type="hidden" name="next" value="{{ next or '' }}">
+        <div class="mb-3">
+          <label class="form-label">Username</label>
+          <input class="form-control" name="username" required />
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Password</label>
+          <input class="form-control" type="password" name="password" required />
+        </div>
+        <button class="btn btn-primary w-100">Log in</button>
+      </form>
+      <div class="mt-3 text-center">
+        No account? <a href="{{ url_for('auth_register_get', next=next) }}">Register</a>
+      </div>
+
+      {% else %}
+      <form method="post" action="{{ url_for('auth_register_post') }}">
+        <input type="hidden" name="next" value="{{ next or '' }}">
+        <div class="mb-3">
+          <label class="form-label">Username</label>
+          <input class="form-control" name="username" required />
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Password</label>
+          <input class="form-control" type="password" name="password" required />
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Choose role</label>
+          <select class="form-select" name="role">
+            <option value="public">public</option>
+            <option value="pro">pro</option>
+            <option value="admin">admin</option>
+          </select>
+          <div class="form-text">Demo only: free choice of pro/admin. Restrict in production.</div>
+        </div>
+        <button class="btn btn-success w-100">Register & log in</button>
+      </form>
+      <div class="mt-3 text-center">
+        Already have an account? <a href="{{ url_for('auth_login_get', next=next) }}">Log in</a>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+TPL_FEED = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Threat Feed</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    /* pill-like grey bar like your screenshot */
+    .filter-bar{ background:#6c757d; border-radius:12px; padding:6px 10px; }
+    .filter-bar .btn{ color:#fff; background:transparent; border:0; padding:6px 10px; }
+    .filter-bar .btn:hover{ background:rgba(255,255,255,.15); color:#fff; }
+    .filter-bar .btn-check:checked + label{ background:rgba(255,255,255,.25); color:#fff; }
+  </style>
+</head>
+<body class="bg-light">
+<nav class="navbar navbar-expand-lg bg-white border-bottom sticky-top">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="{{ url_for('feed') }}">CTI Portal</a>
+    <div class="ms-auto d-flex align-items-center gap-2">
+      {% if current_user %}
+        <span class="badge text-bg-secondary">{{ current_user.username }}</span>
+        <span class="badge text-bg-info text-uppercase">{{ current_user.role }}</span>
+        <a class="btn btn-outline-danger btn-sm" href="{{ url_for('auth_logout') }}">Logout</a>
+      {% endif %}
+    </div>
+  </div>
+</nav>
+
+<div class="container py-3">
+
+  <div class="d-flex align-items-center gap-3 mb-3">
+    <button id="btnFetch" class="btn btn-success btn-sm" type="button">Fetch now</button>
+    <span id="fetchStatus" class="small text-muted"></span>
+  </div>
+
+  <form method="get" class="row g-2 mb-4">
+    <div class="col-md-4">
+      <input class="form-control" type="search" name="q" value="{{ q }}" placeholder="Search title/content…">
+    </div>
+    <div class="col-12">
+      <div class="filter-bar d-flex flex-wrap align-items-center gap-1">
+        {# unified filter list: 'rss' + built-ins #}
+        {% for s in all_filters %}
+          {% set checked = 'checked' if s in sources else '' %}
+          <input type="checkbox" class="btn-check src-check" id="src-{{ s }}" name="source" value="{{ s }}" {{ checked }}>
+          <label class="btn btn-sm" for="src-{{ s }}">
+            {% if s == 'rss' %}My RSS{% else %}{{ source_label.get(s, s) }}{% endif %}
+          </label>
+        {% endfor %}
+      </div>
+      <div class="form-text">Tip: select “My RSS” alone to view your personal RSS articles.</div>
+    </div>
+    <div class="col-12">
+      <button class="btn btn-primary mt-2">Apply</button>
+    </div>
+  </form>
+
+  <div class="card mb-4">
+    <div class="card-body">
+      <div class="d-flex align-items-center justify-content-between">
+        <h5 class="mb-0">RSS Subscriptions</h5>
+      </div>
+      <form class="row g-2 mt-2" method="post" action="{{ url_for('add_rss') }}">
+        <div class="col-md-7">
+          <input name="rss_url" class="form-control" placeholder="https://example.com/feed.xml" required>
+        </div>
+        <div class="col-md-3">
+          <select class="form-select" name="rss_role">
+            {% for r in ROLES %}
+              <option value="{{ r }}">{{ r }}</option>
+            {% endfor %}
+          </select>
+          <div class="form-text">Min role required to see articles from this feed</div>
+        </div>
+        <div class="col-md-2">
+          <button class="btn btn-outline-success w-100" type="submit">Add RSS</button>
+        </div>
+      </form>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="mt-2">
+          {% for cat, msg in messages %}
+            <div class="alert alert-{{ cat }} py-2 mb-2">{{ msg }}</div>
+          {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+
+      <div class="table-responsive mt-3">
+        <table class="table table-sm align-middle">
+          <thead>
+            <tr>
+              <th>URL</th>
+              <th>Status</th>
+              <th>Min role</th>
+              <th>Last status</th>
+              <th>Updated</th>
+              <th style="width:170px">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in rss_list %}
+              <tr>
+                <td><a href="{{ r.url }}" target="_blank" rel="noreferrer">{{ r.url }}</a></td>
+                <td>
+                  {% if r.enabled %}
+                    <span class="badge text-bg-success">enabled</span>
+                  {% else %}
+                    <span class="badge text-bg-secondary">disabled</span>
+                  {% endif %}
+                </td>
+                <td><span class="badge text-bg-info text-uppercase">{{ r.min_role or 'public' }}</span></td>
+                <td class="text-muted">{{ r.last_status or '—' }}</td>
+                <td class="text-muted">{{ fmt_ts(r.updated_at) }}</td>
+                <td>
+                  <form class="d-inline" method="post" action="{{ url_for('source_toggle', sid=r._id|string) }}">
+                    <button class="btn btn-sm {{ 'btn-warning' if r.enabled else 'btn-success' }}" type="submit">
+                      {{ 'Disable' if r.enabled else 'Enable' }}
+                    </button>
+                  </form>
+                  <form class="d-inline" method="post" action="{{ url_for('source_delete', sid=r._id|string) }}" onsubmit="return confirm('Delete this RSS?');">
+                    <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+                  </form>
+                </td>
+              </tr>
+            {% else %}
+              <tr><td colspan="6" class="text-muted">No RSS sources yet. Add one above.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  {% if not rss_mode %}
+  <div class="row g-3">
+    {% for it in items %}
+    {% set item_link = url_for('item_detail', id=it._id|string) %}
+    <div class="col-12">
+      <div class="card shadow-sm">
+        <div class="card-body">
+          {% set st = SOURCE_STYLE.get(it.source, {"name": it.source, "badge":"secondary", "icon":"📰"}) %}
+          <div class="d-flex justify-content-between align-items-center">
+            <span class="badge bg-{{ st.badge }}">{{ st.icon }} {{ st.name }}</span>
+            <small class="text-muted">{{ fmt_ts(it.timestamp) }}</small>
+          </div>
+
+          <h5 class="mt-2"><a class="link-dark text-decoration-none" href="{{ item_link }}">{{ it.title }}</a></h5>
+
+          {% if it.source == 'msrc_blog' %}
+            <p class="text-secondary">{{ brief_for_public(it.content or '') }}</p>
+            <a class="btn btn-sm btn-outline-primary" href="{{ item_link }}">Read</a>
+
+            {% if it.recommendations and it.recommendations.cybok %}
+              <div class="mt-3 p-2 border rounded">
+                <div class="small text-muted mb-1">CyBOK recommendations</div>
+                <ul class="mb-0">
+                  {% for r in it.recommendations.cybok[:5] %}
+                    <li>
+                      {% if r.sid %}
+                        <a href="{{ url_for('cybok_view', sid=r.sid) }}" target="_self">
+                          {{ r.title }}{% if r.section %} ({{ r.section }}){% endif %}
+                        </a>
+                      {% elif r.url and r.url|lower.startswith('/cybok/') %}
+                        <a href="{{ r.url }}" target="_self">
+                          {{ r.title }}{% if r.section %} ({{ r.section }}){% endif %}
+                        </a>
+                      {% elif r.title or r.section %}
+                        <a href="{{ url_for('cybok_byref', title=r.title, section=r.section, version='v1') }}" target="_self">
+                          {{ r.title }}{% if r.section %} ({{ r.section }}){% endif %}
+                        </a>
+                      {% else %}
+                        <a href="{{ item_link }}" target="_self">
+                          {{ r.title or 'CyBOK section' }}{% if r.section %} ({{ r.section }}){% endif %}
+                        </a>
+                      {% endif %}
+
+                      {% if r.score is not none %}
+                        <span class="text-muted ms-1">score {{ '%.2f'|format(r.score) }}</span>
+                      {% endif %}
+                    </li>
+                  {% endfor %}
+                </ul>
+              </div>
+            {% endif %}
+          {% endif %}
+
+          {% if it.source == 'krebsonsecurity' %}
+            {% set cves = extract_cves_from_text((it.title or '') ~ ' ' ~ (it.content or '')) %}
+            {% if cves %}
+              <div class="mb-2"><strong>CVE(s):</strong>
+                {% for c in cves %}
+                  <a class="badge text-bg-dark me-1" href="{{ url_for('cve_detail', cve_id=c) }}">{{ c }}</a>
+                {% endfor %}
+              </div>
+            {% endif %}
+            <div class="mb-2">
+              <span class="badge text-bg-success">Highlights</span>
+              <div class="mt-1 text-secondary">{{ threat_points_for_pro(it.content or '') }}</div>
+            </div>
+            <a class="btn btn-sm btn-outline-primary" href="{{ item_link }}">Read</a>
+          {% endif %}
+
+          {% if it.source == 'cisa_kev' %}
+            <p class="text-secondary">{{ brief_for_public(it.content or '', 260) }}</p>
+            {% set cves = extract_cves_from_text((it.title or '') ~ ' ' ~ (it.content or '')) %}
+            {% if cves %}
+              <div class="mb-2"><strong>KEV includes:</strong>
+                {% for c in cves %}
+                  <a class="badge text-bg-warning me-1" href="{{ url_for('cve_detail', cve_id=c) }}">{{ c }}</a>
+                {% endfor %}
+              </div>
+            {% endif %}
+            <a class="btn btn-sm btn-outline-primary" href="{{ item_link }}">Read</a>
+          {% endif %}
+
+          {% if it.source == 'nvd' %}
+            {% if it.nvd_cvss %}
+              <div class="mb-2">
+                <span class="badge text-bg-danger">CVSS {{ it.nvd_cvss.version or '' }}</span>
+                <span class="ms-2">base: <strong>{{ it.nvd_cvss.baseScore or '—' }}</strong> ({{ it.nvd_cvss.baseSeverity or '—' }})</span>
+                {% if it.nvd_cvss.vectorString %}
+                  <div class="text-muted mt-1"><code>{{ it.nvd_cvss.vectorString }}</code></div>
+                {% endif %}
+              </div>
+            {% endif %}
+            {% if it.nvd_cwes %}
+              <div class="mb-2"><strong>CWE:</strong>
+                {% for w in it.nvd_cwes[:5] %}
+                  <span class="badge text-bg-secondary me-1">{{ w }}</span>
+                {% endfor %}
+              </div>
+            {% endif %}
+            {% if it.nvd_refs %}
+              <div class="mb-2"><strong>Refs:</strong>
+                <ul class="mb-0">
+                  {% for u in it.nvd_refs[:3] %}
+                    <li><a href="{{ u }}" target="_blank" rel="noreferrer">{{ u }}</a></li>
+                  {% endfor %}
+                </ul>
+              </div>
+            {% endif %}
+            <a class="btn btn-sm btn-outline-primary" href="{{ item_link }}">Read</a>
+          {% endif %}
+
+          {% if it.source == 'exploitdb' %}
+            <div class="mb-2">
+              <span class="badge text-bg-dark">Exploit available</span>
+              {% if it.edb_id %}<span class="ms-2 text-muted">EDB-ID: {{ it.edb_id }}</span>{% endif %}
+            </div>
+            {% if it.edb_cves and it.edb_cves|length > 0 %}
+              <div class="mb-2"><strong>Related CVEs:</strong>
+                {% for c in it.edb_cves %}
+                  <a class="badge text-bg-danger me-1" href="{{ url_for('cve_detail', cve_id=c) }}">{{ c }}</a>
+                {% endfor %}
+              </div>
+            {% endif %}
+            <p class="text-secondary">{{ brief_for_public(it.content or '', 240) }}</p>
+            <a class="btn btn-sm btn-outline-primary" href="{{ item_link }}">Read</a>
+          {% endif %}
+
+          {% if it.source not in ['msrc_blog','krebsonsecurity','cisa_kev','nvd','exploitdb'] %}
+            <p class="text-secondary">{{ brief_for_public(it.content or '') }}</p>
+            <a class="btn btn-sm btn-outline-primary" href="{{ item_link }}">Read</a>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="row g-3">
+    {% for it in items %}
+    <div class="col-12">
+      <div class="card shadow-sm">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center">
+            <span class="badge bg-info">🔗 My RSS</span>
+            <small class="text-muted">{{ fmt_ts(it.timestamp) }}</small>
+          </div>
+          <h5 class="mt-2">
+            <a class="link-dark text-decoration-none" href="{{ it.url }}" target="_blank" rel="noopener">
+              {{ it.title }}
+            </a>
+          </h5>
+          <p class="text-secondary">{{ brief_for_public(it.content or '', 240) }}</p>
+          <a class="btn btn-sm btn-outline-primary" href="{{ it.url }}" target="_blank" rel="noopener">Open original</a>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <nav class="mt-3">
+    <ul class="pagination">
+      <li class="page-item {% if not pager.has_prev %}disabled{% endif %}">
+        <a class="page-link" href="?page={{ pager.prev }}&q={{ q }}{% for s in sources %}&source={{ s }}{% endfor %}">Prev</a>
+      </li>
+      <li class="page-item disabled"><span class="page-link">Page {{ pager.page }} / {{ pager.pages }} ({{ pager.total }} items)</span></li>
+      <li class="page-item {% if not pager.has_next %}disabled{% endif %}">
+        <a class="page-link" href="?page={{ pager.next }}&q={{ q }}{% for s in sources %}&source={{ s }}{% endfor %}">Next</a>
+      </li>
+    </ul>
+  </nav>
+</div>
+
+<script>
+(function(){
+  // Celery polling
+  const btn = document.getElementById('btnFetch');
+  const statusEl = document.getElementById('fetchStatus');
+
+  function setStatus(text){ statusEl.textContent = text; }
+  function poll(taskId){
+    fetch(`{{ url_for('task_status', task_id='__TASK__') }}`.replace('__TASK__', taskId))
+      .then(r=>r.json())
+      .then(d=>{
+        const step = d.meta && d.meta.step ? ` · ${d.meta.step}` : '';
+        setStatus(`${d.state}${step}`);
+        if (d.state === 'SUCCESS' || d.state === 'FAILURE') {
+          btn.disabled = false;
+        } else {
+          setTimeout(()=>poll(taskId), 2000);
+        }
+      })
+      .catch(()=>{ btn.disabled = false; setStatus('Error polling'); });
+  }
+
+  btn.addEventListener('click', function(){
+    btn.disabled = true;
+    setStatus('Starting…');
+    fetch(`{{ url_for('fetch_now') }}`, {method:'POST'})
+      .then(r=>r.json())
+      .then(d=>{
+        if (!d.task_id){ throw new Error('no task id'); }
+        setStatus(`Queued: ${d.task_id}`);
+        poll(d.task_id);
+      })
+      .catch(()=>{ btn.disabled=false; setStatus('Failed to enqueue'); });
+  });
+
+  // My RSS is exclusive with other sources
+  const checks = Array.from(document.querySelectorAll('.src-check'));
+  const rss = document.getElementById('src-rss');
+  if (rss){
+    rss.addEventListener('change', ()=>{
+      if (rss.checked){
+        checks.forEach(c=>{ if(c!==rss) c.checked=false; });
+      }
+    });
+    checks.forEach(c=>{
+      if (c!==rss){
+        c.addEventListener('change', ()=>{
+          if (c.checked){ rss.checked=false; }
+        });
+      }
+    });
+  }
+})();
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+"""
+
+TPL_CVE = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ cve_id }} · NVD</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+<nav class="navbar navbar-expand-lg bg-white border-bottom">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="{{ url_for('feed') }}">CTI Portal</a>
+  </div>
+</nav>
+
+<div class="container py-4">
+  <h3 class="mb-3">{{ cve_id }}</h3>
+
+  {% if not data %}
+    <div class="alert alert-warning">Failed to fetch from NVD (network/quota/not found).</div>
+  {% else %}
+    <div class="card mb-3">
+      <div class="card-body">
+        <h5>Description</h5>
+        <p class="text-secondary">{{ data.description or '—' }}</p>
+      </div>
+    </div>
+
+    <div class="row g-3">
+      <div class="col-md-6">
+        <div class="card h-100">
+          <div class="card-body">
+            <h5>CVSS</h5>
+            {% if data.cvss %}
+              <ul class="mb-0">
+                <li>Version: {{ data.cvss.version or '—' }}</li>
+                <li>Base score: <strong>{{ data.cvss.baseScore or '—' }}</strong> ({{ data.cvss.baseSeverity or '—' }})</li>
+                <li>Vector: <code>{{ data.cvss.vectorString or '—' }}</code></li>
+              </ul>
+            {% else %}
+              <div class="text-muted">No CVSS available</div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+
+      <div class="col-md-6">
+        <div class="card h-100">
+          <div class="card-body">
+            <h5>CWE (Weaknesses)</h5>
+            {% if data.weaknesses %}
+              <ul class="mb-0">
+                {% for w in data.weaknesses %}<li>{{ w }}</li>{% endfor %}
+              </ul>
+            {% else %}
+              <div class="text-muted">No CWE info</div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-body">
+        <h5>References</h5>
+        {% if data.references %}
+          <ul class="mb-0">
+            {% for r in data.references %}
+              <li>
+                <a href="{{ r.url }}" target="_blank" rel="noreferrer">{{ r.url }}</a>
+                {% if r.tags %}
+                  <span class="ms-2">
+                    {% for t in r.tags %}
+                      <span class="badge text-bg-secondary">{{ t }}</span>
+                    {% endfor %}
+                  </span>
+                {% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <div class="text-muted">No references</div>
+        {% endif %}
+      </div>
+    </div>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+TPL_ITEM = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ it.title }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+<nav class="navbar navbar-expand-lg bg-white border-bottom">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="{{ url_for('feed') }}">CTI Portal</a>
+  </div>
+</nav>
+
+<div class="container py-4">
+  <h3 class="mb-1">{{ it.title }}</h3>
+  <div class="text-muted mb-3">{{ it.source }} · {{ fmt_ts(it.timestamp) }}</div>
+
+  {% if it.content %}
+    <article class="card">
+      <div class="card-body" style="white-space:pre-wrap; line-height:1.7">{{ it.content }}</div>
+    </article>
+  {% else %}
+    <div class="alert alert-secondary">No content captured yet.</div>
+  {% endif %}
+
+  {% if it.url %}
+    <div class="mt-3">
+      <a class="btn btn-sm btn-outline-secondary" href="{{ it.url }}" target="_blank" rel="noopener">Original</a>
+    </div>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+# ----------------- Entry -----------------
 if __name__ == "__main__":
-    main()
+    celery_proc = subprocess.Popen(
+        [sys.executable, "-m", "celery", "-A", "worker.tasks", "worker", "-l", "info", "--pool=solo"]
+    )
+    try:
+        app.run(debug=True)
+    finally:
+        celery_proc.terminate()
