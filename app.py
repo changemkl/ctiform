@@ -6,7 +6,7 @@ from urllib.parse import urlencode
 from celery.result import AsyncResult
 from worker.celery_app import celery
 import subprocess, sys
-from worker.tasks import run_fetch_and_reco 
+from worker.tasks import run_fetch_and_reco, run_fetch_user_rss_once
 import requests
 from flask import (
     Flask, request, redirect, url_for, render_template_string,
@@ -146,6 +146,10 @@ def get_current_user():
     except Exception:
         return None
 
+def current_user_id():
+    u = get_current_user()
+    return u["_id"] if u else None
+
 def current_role() -> str:
     u = get_current_user()
     return u["role"] if u and u.get("role") in ROLES else "public"
@@ -167,6 +171,7 @@ def inject_helpers():
         threat_points_for_pro=threat_points_for_pro,
         fmt_ts=fmt_ts,
         current_user=get_current_user(),
+        ROLES=ROLES
     )
 
 # ----------------- NVD API (for /cve/<id>) -----------------
@@ -272,11 +277,12 @@ def auth_logout():
 def index():
     return redirect(url_for("feed"))
 
-# Feed (login required)
+# Feed (login required) + RSS manager (owner-bound)
 @app.route("/feed")
 @login_required
 def feed():
     role = current_role()
+    owner = current_user_id()
     q = (request.args.get("q") or "").strip()
     since = parse_dt(request.args.get("since"))
     until = parse_dt(request.args.get("until"))
@@ -288,63 +294,94 @@ def feed():
 
     items = []; total = 0
     if allowed_sources:
-        # If your documents have an "allowed_roles" array, you can switch to {"allowed_roles": {"$in": [role]}}
-        filt = {"source": {"$in": allowed_sources}, "allowed_roles": role}
-        if q:
-            filt["$or"] = [
-                {"title": {"$regex": q, "$options": "i"}},
-                {"content": {"$regex": q, "$options": "i"}},
-            ]
-        if since or until:
-            rng = {}
-            if since: rng["$gte"] = since
-            if until: rng["$lte"] = until
-            filt["timestamp"] = rng
+        other_sources = [s for s in allowed_sources if s != "user"]
+        ors = []
 
-        total = coll.count_documents(filt)
-        items = list(
-            coll.find(
-                filt,
-                {
-                    "title":1,"url":1,"content":1,"timestamp":1,"source":1,"min_role":1,
-                    "nvd_cvss":1,"nvd_cwes":1,"nvd_refs":1,
-                    "edb_id":1,"edb_cves":1,
-                    "recommendations.cybok": 1,
-                }
+        # Branch for built-in sources (role-gated)
+        if other_sources:
+            branch_other = {"source": {"$in": other_sources}, "allowed_roles": role}
+            if q:
+                branch_other["$or"] = [
+                    {"title": {"$regex": q, "$options": "i"}},
+                    {"content": {"$regex": q, "$options": "i"}},
+                ]
+            if since or until:
+                rng = {}
+                if since: rng["$gte"] = since
+                if until: rng["$lte"] = until
+                branch_other["timestamp"] = rng
+            ors.append(branch_other)
+
+        # Branch for user-owned RSS articles
+        if "user" in allowed_sources:
+            branch_user = {
+                        "source": "user",
+                        "$or": [
+                            {"owner": current_user_id()},
+                            {"owner": {"$exists": False}}
+                        ]
+                    }
+            if q:
+                branch_user["$or"] = [
+                    {"title": {"$regex": q, "$options": "i"}},
+                    {"content": {"$regex": q, "$options": "i"}},
+                ]
+            if since or until:
+                rng = {}
+                if since: rng["$gte"] = since
+                if until: rng["$lte"] = until
+                branch_user["timestamp"] = rng
+            ors.append(branch_user)
+
+        if ors:
+            filt = {"$or": ors}
+            total = coll.count_documents(filt)
+            items = list(
+                coll.find(
+                    filt,
+                    {
+                        "title":1,"url":1,"content":1,"timestamp":1,"source":1,"min_role":1,
+                        "nvd_cvss":1,"nvd_cwes":1,"nvd_refs":1,
+                        "edb_id":1,"edb_cves":1,
+                        "recommendations.cybok": 1,
+                    }
+                )
+                .sort([("timestamp", -1)])
+                .skip((page - 1) * page_size)
+                .limit(page_size)
             )
-            .sort([("timestamp", -1)])
-            .skip((page - 1) * page_size)
-            .limit(page_size)
-        )
 
     pages = max(1, math.ceil(total / page_size))
     pager = {"total": total, "page": page, "pages": pages,
              "page_size": page_size, "has_prev": page > 1, "has_next": page < pages,
              "prev": page - 1, "next": page + 1}
 
+    # Only show current user's RSS subscriptions
+    rss_list = list(
+        sources_coll.find({"mode": "rss", "owner": owner}).sort([("updated_at", -1)])
+    )
+
     resp = make_response(render_template_string(
         TPL_FEED,
         items=items, pager=pager, q=q,
         sources=req_sources,
         source_label={k: v["name"] for k, v in SOURCE_STYLE.items()},
-        all_sources=ARTICLE_SOURCES
+        all_sources=ARTICLE_SOURCES,
+        rss_list=rss_list
     ))
     return resp
 
-# --- NEW: enqueue fetch -> reco (everyone logged-in can use) ---
+# --- enqueue fetch -> reco (everyone logged-in can use) ---
 @app.post("/fetch_now")
 @login_required
 def fetch_now():
-    # Kick off the task
-    ar = run_fetch_and_reco.delay()  # or whatever your task is
-
-    # Return ONLY JSON-serializable fields
+    ar = run_fetch_and_reco.delay()
     return jsonify({
         "task_id": ar.id,
-        "state": ar.state  # usually 'PENDING' right after delay()
+        "state": ar.state
     })
 
-# --- NEW: poll task status ---
+# --- poll task status ---
 @app.get("/task_status/<task_id>")
 @login_required
 def task_status(task_id):
@@ -366,7 +403,6 @@ def get_task_status(task_id: str) -> dict:
     return payload
 
 def _safe_info(val):
-    # Make Celery's .info/.result JSON-friendly
     if isinstance(val, Exception):
         return {"error": str(val)}
     if isinstance(val, (dict, list, str, int, float, bool)) or val is None:
@@ -510,22 +546,24 @@ def cybok_byref():
     </body></html>
     """, section=safe_section, title=safe_title, body=body_html)
 
-# Add RSS source (login required)
+# ----------------- RSS management (owner-bound) -----------------
 @app.post("/add_rss")
 @login_required
 def add_rss():
-    role = current_role()
+    owner = current_user_id()
     rss_url = (request.form.get("rss_url") or "").strip()
-    role_sel = (request.form.get("rss_role") or "public").strip()
+    role_sel = (request.form.get("rss_role") or "public").strip().lower()
     if role_sel not in ROLES:
         role_sel = "public"
     if not rss_url or not re.match(r"^https?://", rss_url, re.I):
+        flash("Invalid RSS URL.", "warning")
         return redirect(url_for("feed"))
 
     now = datetime.now(timezone.utc)
     sources_coll.update_one(
-        {"url": rss_url},
+        {"owner": owner, "mode": "rss", "url": rss_url},
         {"$set": {
+            "owner": owner,
             "url": rss_url,
             "mode": "rss",
             "min_role": role_sel,
@@ -539,6 +577,44 @@ def add_rss():
         }},
         upsert=True
     )
+
+    # enqueue immediate single-feed fetch for this user + URL
+    ar = run_fetch_user_rss_once.delay(str(owner), rss_url)
+    flash(f"RSS saved & initial fetch queued (task: {ar.id})", "success")
+    return redirect(url_for("feed"))
+
+@app.post("/sources/<sid>/toggle")
+@login_required
+def source_toggle(sid):
+    owner = current_user_id()
+    try:
+        oid = ObjectId(sid)
+    except Exception:
+        flash("Invalid source id.", "warning")
+        return redirect(url_for("feed"))
+    doc = sources_coll.find_one({"_id": oid, "owner": owner})
+    if not doc:
+        flash("Source not found or no permission.", "warning")
+        return redirect(url_for("feed"))
+    new_enabled = not bool(doc.get("enabled", True))
+    sources_coll.update_one({"_id": oid, "owner": owner}, {"$set": {"enabled": new_enabled, "updated_at": datetime.now(timezone.utc)}})
+    flash(("Enabled" if new_enabled else "Disabled") + " RSS source.", "info")
+    return redirect(url_for("feed"))
+
+@app.post("/sources/<sid>/delete")
+@login_required
+def source_delete(sid):
+    owner = current_user_id()
+    try:
+        oid = ObjectId(sid)
+    except Exception:
+        flash("Invalid source id.", "warning")
+        return redirect(url_for("feed"))
+    res = sources_coll.delete_one({"_id": oid, "owner": owner})
+    if res.deleted_count == 0:
+        flash("Source not found or no permission.", "warning")
+    else:
+        flash("RSS source deleted.", "danger")
     return redirect(url_for("feed"))
 
 # ----------------- Templates -----------------
@@ -639,13 +715,14 @@ TPL_FEED = r"""
 
 <div class="container py-3">
 
-  <!-- Everyone logged-in can trigger a fetch -->
+  <!-- Task trigger -->
   <div class="d-flex align-items-center gap-3 mb-3">
     <button id="btnFetch" class="btn btn-success btn-sm" type="button">Fetch now</button>
     <span id="fetchStatus" class="small text-muted"></span>
   </div>
 
-  <form method="get" class="row g-2 mb-3">
+  <!-- Filters -->
+  <form method="get" class="row g-2 mb-4">
     <div class="col-md-4">
       <input class="form-control" type="search" name="q" value="{{ q }}" placeholder="Search title/content…">
     </div>
@@ -663,6 +740,86 @@ TPL_FEED = r"""
     </div>
   </form>
 
+  <!-- RSS Manager -->
+  <div class="card mb-4">
+    <div class="card-body">
+      <div class="d-flex align-items-center justify-content-between">
+        <h5 class="mb-0">RSS Subscriptions</h5>
+      </div>
+      <form class="row g-2 mt-2" method="post" action="{{ url_for('add_rss') }}">
+        <div class="col-md-7">
+          <input name="rss_url" class="form-control" placeholder="https://example.com/feed.xml" required>
+        </div>
+        <div class="col-md-3">
+          <select class="form-select" name="rss_role">
+            {% for r in ROLES %}
+              <option value="{{ r }}">{{ r }}</option>
+            {% endfor %}
+          </select>
+          <div class="form-text">Min role required to see articles from this feed</div>
+        </div>
+        <div class="col-md-2">
+          <button class="btn btn-outline-success w-100" type="submit">Add RSS</button>
+        </div>
+      </form>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="mt-2">
+          {% for cat, msg in messages %}
+            <div class="alert alert-{{ cat }} py-2 mb-2">{{ msg }}</div>
+          {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+
+      <div class="table-responsive mt-3">
+        <table class="table table-sm align-middle">
+          <thead>
+            <tr>
+              <th>URL</th>
+              <th>Status</th>
+              <th>Min role</th>
+              <th>Last status</th>
+              <th>Updated</th>
+              <th style="width:170px">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in rss_list %}
+              <tr>
+                <td><a href="{{ r.url }}" target="_blank" rel="noreferrer">{{ r.url }}</a></td>
+                <td>
+                  {% if r.enabled %}
+                    <span class="badge text-bg-success">enabled</span>
+                  {% else %}
+                    <span class="badge text-bg-secondary">disabled</span>
+                  {% endif %}
+                </td>
+                <td><span class="badge text-bg-info text-uppercase">{{ r.min_role or 'public' }}</span></td>
+                <td class="text-muted">{{ r.last_status or '—' }}</td>
+                <td class="text-muted">{{ fmt_ts(r.updated_at) }}</td>
+                <td>
+                  <form class="d-inline" method="post" action="{{ url_for('source_toggle', sid=r._id|string) }}">
+                    <button class="btn btn-sm {{ 'btn-warning' if r.enabled else 'btn-success' }}" type="submit">
+                      {{ 'Disable' if r.enabled else 'Enable' }}
+                    </button>
+                  </form>
+                  <form class="d-inline" method="post" action="{{ url_for('source_delete', sid=r._id|string) }}" onsubmit="return confirm('Delete this RSS?');">
+                    <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+                  </form>
+                </td>
+              </tr>
+            {% else %}
+              <tr><td colspan="6" class="text-muted">No RSS sources yet. Add one above.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Items -->
   <div class="row g-3">
     {% for it in items %}
     {% set item_link = url_for('item_detail', id=it._id|string) %}
@@ -996,5 +1153,4 @@ if __name__ == "__main__":
     try:
         app.run(debug=True)
     finally:
-        celery_proc.terminate()    
-    app.run(debug=True)
+        celery_proc.terminate()
