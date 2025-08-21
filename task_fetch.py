@@ -1,12 +1,11 @@
 # task_fetch.py
-import os, re, logging, hashlib, html, time, random
+import os, re, logging, hashlib, html
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 import requests
 import feedparser
 from pymongo import MongoClient, UpdateOne
-from pymongo.errors import AutoReconnect, ConnectionFailure, NetworkTimeout, ExecutionTimeout, BulkWriteError
 
 # ---------- Configuration ----------
 MONGODB_URI = os.getenv(
@@ -15,12 +14,6 @@ MONGODB_URI = os.getenv(
 )
 DB_NAME = os.getenv("DB_NAME", "cti_platform")
 NVD_API_KEY = os.getenv("NVD_API_KEY", "").strip()
-
-# Exponential backoff parameters
-MAX_RETRIES = int(os.getenv("BACKOFF_MAX_RETRIES", "5"))        # number of retry attempts
-BASE_DELAY = float(os.getenv("BACKOFF_BASE_SECONDS", "0.5"))     # initial delay in seconds
-MAX_DELAY = float(os.getenv("BACKOFF_MAX_SECONDS", "20"))        # cap delay
-JITTER_BOUND = float(os.getenv("BACKOFF_JITTER_SECONDS", "0.5")) # additional random jitter [0, JITTER_BOUND]
 
 ROLES = ["public", "pro", "admin"]
 ROLE_ORDER = {"public": 0, "pro": 1, "admin": 2}
@@ -59,88 +52,6 @@ def extract_cves(s: str | None):
     if not s:
         return []
     return sorted(set(m.upper() for m in CVE_RE.findall(s)))
-
-# ====== Backoff helpers ======
-def _retryable_http(resp: requests.Response | None, err: Exception | None) -> bool:
-    """Decide if an HTTP operation is retryable (network errors, throttling, server errors)."""
-    if err is not None:
-        return True
-    if resp is None:
-        return True
-    return resp.status_code in (408, 409, 425, 429, 500, 502, 503, 504)
-
-def _sleep_backoff(attempt: int):
-    """Exponential backoff with bounded jitter."""
-    delay = min(MAX_DELAY, BASE_DELAY * (2 ** attempt))
-    delay += random.uniform(0, JITTER_BOUND)
-    time.sleep(delay)
-
-_session = requests.Session()
-
-def http_get(url: str, **kwargs) -> requests.Response:
-    """GET with exponential backoff."""
-    last_err = None
-    for i in range(MAX_RETRIES):
-        resp = None
-        try:
-            resp = _session.get(url, **kwargs)
-            if not _retryable_http(resp, None):
-                return resp
-            logging.warning("HTTP GET %s -> %s; retry %d/%d", url, resp.status_code, i+1, MAX_RETRIES)
-        except Exception as e:
-            last_err = e
-            logging.warning("HTTP GET %s error: %s; retry %d/%d", url, e, i+1, MAX_RETRIES)
-        _sleep_backoff(i)
-    if last_err:
-        raise last_err
-    raise RuntimeError(f"HTTP GET failed after {MAX_RETRIES} retries: {url}")
-
-def http_post(url: str, **kwargs) -> requests.Response:
-    """POST with exponential backoff."""
-    last_err = None
-    for i in range(MAX_RETRIES):
-        resp = None
-        try:
-            resp = _session.post(url, **kwargs)
-            if not _retryable_http(resp, None):
-                return resp
-            logging.warning("HTTP POST %s -> %s; retry %d/%d", url, resp.status_code, i+1, MAX_RETRIES)
-        except Exception as e:
-            last_err = e
-            logging.warning("HTTP POST %s error: %s; retry %d/%d", url, e, i+1, MAX_RETRIES)
-        _sleep_backoff(i)
-    if last_err:
-        raise last_err
-    raise RuntimeError(f"HTTP POST failed after {MAX_RETRIES} retries: {url}")
-
-def parse_feed_with_backoff(feed_url: str):
-    """feedparser.parse with exponential backoff."""
-    last_err = None
-    for i in range(MAX_RETRIES):
-        try:
-            return feedparser.parse(feed_url)
-        except Exception as e:
-            last_err = e
-            logging.warning("feedparser %s error: %s; retry %d/%d", feed_url, e, i+1, MAX_RETRIES)
-            _sleep_backoff(i)
-    if last_err:
-        raise last_err
-    raise RuntimeError(f"feedparser failed after {MAX_RETRIES} retries: {feed_url}")
-
-def bulk_write_with_backoff(ops):
-    """Mongo bulk_write with exponential backoff on transient errors."""
-    last_err = None
-    for i in range(MAX_RETRIES):
-        try:
-            return coll.bulk_write(ops, ordered=False)
-        except (AutoReconnect, ConnectionFailure, NetworkTimeout, ExecutionTimeout, BulkWriteError) as e:
-            last_err = e
-            logging.warning("Mongo bulk_write transient error: %s; retry %d/%d", e, i+1, MAX_RETRIES)
-            _sleep_backoff(i)
-        except Exception:
-            raise
-    if last_err:
-        raise last_err
 
 # ====== Common: sentence splitting / denoising / summarization ======
 _SENT_SPLIT = re.compile(r"(?<=[。！？!?\.])\s+")
@@ -280,6 +191,85 @@ def extract_msrc_body(html_doc: str) -> str:
         raw = full
     return raw
 
+    
+# ====== Single RSS fetch (for immediate run after adding) ======
+def crawl_user_rss_one(feed_url: str, max_items_per_feed: int = 40, timeout: int = 25):
+    """
+    Crawl one specific RSS feed URL that already exists in custom_sources.
+    Returns a list of docs ready for upsert_many().
+    Also updates last_crawled / last_status on sources_coll for this URL.
+    """
+    logging.info("[user_rss_one] %s", feed_url)
+    now = datetime.now(timezone.utc)
+    rcd = sources_coll.find_one({"url": feed_url})
+    if not rcd:
+        logging.warning("[user_rss_one] not found in custom_sources: %s", feed_url)
+        return []
+
+    role = (rcd.get("min_role") or "public").lower()
+    if role not in ROLES:
+        role = "public"
+
+    docs = []
+    try:
+        feed = parse_feed_with_backoff(feed_url)
+        cnt = 0
+        for e in feed.entries:
+            if cnt >= max_items_per_feed:
+                break
+            link = (getattr(e, "link", "") or "").strip()
+            if not link or not link.startswith(("http://", "https://")):
+                continue
+
+            try:
+                resp = http_get(link, timeout=timeout, headers=UA)
+                resp.raise_for_status()
+                _, full = extract_main_content(resp.text)
+                title = clean_text(getattr(e, "title", "") or link)
+                content = make_summary(full, max_chars=260)
+            except Exception:
+                title = clean_text(getattr(e, "title", "") or link)
+                raw = clean_text(getattr(e, "summary", "") or getattr(e, "description", "") or "")
+                content = make_summary(raw, max_chars=260)
+
+            ts = _entry_datetime(e)
+            docs.append({
+                "source": "user",
+                "source_id": f"user:{hashlib.sha1(link.encode()).hexdigest()}",
+                "title": title or link,
+                "url": link,
+                "content": content,
+                "timestamp": ts,
+                "min_role": role,
+                "allowed_roles": roles_at_or_above(role),
+                "origin": urlparse(link).netloc,
+            })
+            cnt += 1
+
+        sources_coll.update_one(
+            {"_id": rcd["_id"]},
+            {"$set": {"last_crawled": now, "last_status": f"ok:{cnt}", "updated_at": now}}
+        )
+        logging.info("[user_rss_one] %s -> %d items", feed_url, cnt)
+    except Exception as e:
+        logging.warning("[user_rss_one] fail %s: %s", feed_url, e)
+        sources_coll.update_one(
+            {"_id": rcd["_id"]},
+            {"$set": {"last_crawled": now, "last_status": f"error:{e.__class__.__name__}", "updated_at": now}}
+        )
+    return docs
+
+
+def fetch_and_upsert_user_rss_one(feed_url: str, max_items_per_feed: int = 40):
+    """
+    Helper: crawl one RSS and upsert into Mongo.
+    Returns (inserted_count, total_docs).
+    """
+    docs = crawl_user_rss_one(feed_url, max_items_per_feed=max_items_per_feed)
+    ins, _ = upsert_many(docs)
+    return ins, len(docs)
+
+
 # ====== KrebsOnSecurity-specific body extraction (no title) ======
 def extract_krebs_body(html_doc: str) -> str:
     """
@@ -324,7 +314,7 @@ def upsert_many(docs):
             upsert=True
         ))
     try:
-        res = bulk_write_with_backoff(ops)
+        res = coll.bulk_write(ops, ordered=False)
         ins = getattr(res, "upserted_count", 0)
         return ins, len(ops) - ins
     except Exception as e:
@@ -356,7 +346,7 @@ def crawl_cisa_kev(limit=2000):
     docs, now = [], datetime.now(timezone.utc)
     for url in urls:
         try:
-            r = http_get(url, timeout=30, headers=UA)
+            r = requests.get(url, timeout=30, headers=UA)
             r.raise_for_status()
             data = r.json()
             vulns = data.get("vulnerabilities") or []
@@ -389,13 +379,13 @@ def crawl_krebsonsecurity(limit=40):
     feed_url = "https://krebsonsecurity.com/feed/"
     docs = []
     try:
-        feed = parse_feed_with_backoff(feed_url)
+        feed = feedparser.parse(feed_url)
         for e in feed.entries[:limit]:
             link = (getattr(e, "link", "") or "").strip()
             if not link:
                 continue
             try:
-                r = http_get(link, timeout=25, headers=UA)
+                r = requests.get(link, timeout=25, headers=UA)
                 r.raise_for_status()
                 # Krebs: summary from body paragraphs only (no title mixed in)
                 raw = extract_krebs_body(r.text)
@@ -425,13 +415,13 @@ def crawl_msrc_blog(limit=40):
     feed_url = "https://msrc.microsoft.com/blog/feed/"
     docs = []
     try:
-        feed = parse_feed_with_backoff(feed_url)
+        feed = feedparser.parse(feed_url)
         for e in feed.entries[:limit]:
             link = (getattr(e, "link", "") or "").strip()
             if not link:
                 continue
             try:
-                r = http_get(link, timeout=25, headers=UA)
+                r = requests.get(link, timeout=25, headers=UA)
                 r.raise_for_status()
                 raw = extract_msrc_body(r.text)  # Only body text (no title)
                 # Title from RSS or <title>, but do not prepend to summary
@@ -459,6 +449,106 @@ def crawl_msrc_blog(limit=40):
         logging.error("[msrc_blog] error: %s", e)
     return docs
 
+def crawl_threatfox(limit=600, days=3, timeout=30):
+    """
+    Pull recent IOCs from ThreatFox official API.
+    Docs: https://threatfox.abuse.ch/api/
+    - query: get_iocs
+    - days: 1..7 (based on first_seen)  [default 3]
+    - limit: API enforces caps; we further cap client-side [default 600]
+    Stored fields:
+      indicator, ioc_type, malware, actor, confidence, tags, related_cves
+    Visibility:
+      min_role='pro', allowed_roles=roles_at_or_above('pro')
+    """
+    logging.info("[threatfox] using API min_role=pro days=%d limit=%d", days, limit)
+
+    url = "https://threatfox.abuse.ch/api/"
+    headers = {"User-Agent": "cti-crawler/1.0", "Content-Type": "application/json"}
+    payload = {"query": "get_iocs", "days": max(1, min(7, int(days))), "limit": int(limit)}
+
+    docs = []
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        data = r.json() if r.headers.get("content-type","").lower().startswith("application/json") else {}
+        iocs = data.get("data") or []  # list of IOC dicts
+        if not iocs:
+            logging.info("[threatfox] API returned no data.")
+            return []
+
+        # Normalize & map fields
+        for row in iocs[:limit]:
+            # API fields (see docs): ioc, ioc_type, malware, malware_printable, threat_type,
+            # confidence_level, first_seen, last_seen, tags (list), reference, reporter, ...
+            indicator = row.get("ioc") or ""
+            ioc_type = (row.get("ioc_type") or "").upper() or None
+            malware = row.get("malware_printable") or row.get("malware") or None
+            actor = row.get("threat_actor") or row.get("actor") or None
+            # ThreatFox uses 'confidence_level' 0..100
+            confidence = None
+            try:
+                v = row.get("confidence_level")
+                if v is not None:
+                    confidence = max(0, min(100, int(v)))
+            except Exception:
+                confidence = None
+            tags = row.get("tags") or []
+            if isinstance(tags, str):
+                tags = [t.strip() for t in re.split(r"[,\s]+", tags) if t.strip()]
+
+            # Build title/content
+            title_bits = [ioc_type or "IOC", indicator]
+            if malware: title_bits.append(f"[{malware}]")
+            title = " ".join([b for b in title_bits if b])
+            summary_src = " ".join([
+                str(row.get("threat_type") or ""),
+                str(row.get("reference") or ""),
+                " ".join(tags) if tags else ""
+            ]).strip()
+            content = make_summary(summary_src or title, max_chars=260)
+
+            # Timestamps
+            ts_str = row.get("first_seen") or row.get("last_seen")
+            try:
+                # ThreatFox ISO is like "2025-08-18 12:34:56 UTC" or ISO8601
+                ts_str2 = ts_str.replace(" UTC", "+00:00") if isinstance(ts_str, str) else None
+                ts = datetime.fromisoformat(ts_str2) if ts_str2 and "T" in ts_str2 else datetime.now(timezone.utc)
+            except Exception:
+                ts = datetime.now(timezone.utc)
+
+            related_cves = extract_cves(" ".join([title, content, malware or "", " ".join(tags)]))
+
+            link = row.get("reference") or "https://threatfox.abuse.ch/"
+            source_id = f"threatfox:{hashlib.sha1((indicator or link or title).encode()).hexdigest()}"
+
+            docs.append({
+                "source": "threatfox",
+                "source_id": source_id,
+                "title": title or "ThreatFox IOC",
+                "url": link,
+                "content": content,
+                "timestamp": ts,
+                "min_role": "pro",
+                "allowed_roles": roles_at_or_above("pro"),
+                "origin": urlparse(link).netloc or "threatfox.abuse.ch",
+
+                # IOC-centric fields for UI
+                "indicator": indicator or None,
+                "ioc_type": ioc_type,
+                "malware": malware,
+                "actor": actor,
+                "confidence": confidence,
+                "tags": tags[:16],
+                "related_cves": related_cves,
+            })
+        return docs
+
+    except Exception as e:
+        logging.error("[threatfox] API error: %s", e)
+        return []
+
+
 
 # ---------- NVD & Exploit-DB ----------
 def crawl_nvd_recent(days=7, max_items=200):
@@ -477,7 +567,7 @@ def crawl_nvd_recent(days=7, max_items=200):
 
     docs = []
     try:
-        r = http_get(
+        r = requests.get(
             "https://services.nvd.nist.gov/rest/json/cves/2.0",
             params=params, headers=headers, timeout=30
         )
@@ -555,7 +645,7 @@ def crawl_exploitdb(limit=60):
     feed_url = "https://www.exploit-db.com/rss.xml"
     docs = []
     try:
-        feed = parse_feed_with_backoff(feed_url)
+        feed = feedparser.parse(feed_url)
         for e in feed.entries[:limit]:
             link = (getattr(e, "link", "") or "").strip()
             if not link:
@@ -597,7 +687,7 @@ def crawl_user_rss(limit_sources=200, max_items_per_feed=40, timeout=25):
         if role not in ROLES:
             role = "public"
         try:
-            feed = parse_feed_with_backoff(feed_url)
+            feed = feedparser.parse(feed_url)
             cnt = 0
             for e in feed.entries:
                 if cnt >= max_items_per_feed:
@@ -607,7 +697,7 @@ def crawl_user_rss(limit_sources=200, max_items_per_feed=40, timeout=25):
                     continue
 
                 try:
-                    resp = http_get(link, timeout=timeout, headers=UA)
+                    resp = requests.get(link, timeout=timeout, headers=UA)
                     resp.raise_for_status()
                     # Generic main-body -> summary (do not prepend the title)
                     _, full = extract_main_content(resp.text)
@@ -653,6 +743,7 @@ def main():
         ("cisa_kev", crawl_cisa_kev, {"limit": 2000}),
         ("krebsonsecurity", crawl_krebsonsecurity, {"limit": 40}),
         ("msrc_blog", crawl_msrc_blog, {"limit": 40}),
+        ("threatfox", crawl_threatfox, {"limit": 60}),
         ("nvd", crawl_nvd_recent, {"days": 7, "max_items": 200}),
         ("exploitdb", crawl_exploitdb, {"limit": 60}),
     ]
