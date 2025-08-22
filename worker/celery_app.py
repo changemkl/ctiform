@@ -32,9 +32,17 @@ if os.getenv("DISABLE_BEAT", "0") != "1":
             "task": "worker.tasks.run_fetch_and_reco",
             "schedule": 600.0,  # 或 crontab(minute="*/10")
         },
-        "run-reco-gridfs-3am": {
+        "nightly-fetch-0030": {
+            "task": "worker.tasks.run_fetch",
+            "schedule": crontab(minute=30, hour=0),   # 00:30
+        },
+        "nightly-cybok-ingest-0100": {
+            "task": "worker.tasks.run_ingest_cybok_intro_pdf",
+            "schedule": crontab(minute=0, hour=1),    # 01:00
+        },
+        "nightly-cybok-reco-0130": {
             "task": "worker.tasks.run_cybok_reco_gridfs",
-            "schedule": crontab(minute=0, hour=3),
+            "schedule": crontab(minute=30, hour=1),   # 01:30
         },
     }
 else:
