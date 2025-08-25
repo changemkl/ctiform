@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}{{ it.title }}{% endblock %}
+{% block content %}
+<h3 class="mb-1">{{ it.title }}</h3>
+<div class="text-muted mb-3">{{ it.source }} · {{ fmt_ts(it.timestamp) }}</div>
+
+{% if it.content %}
+  <article class="card"><div class="card-body" style="white-space:pre-wrap; line-height:1.7">{{ it.content }}</div></article>
+{% else %}
+  <div class="alert alert-secondary">No content captured yet.</div>
+{% endif %}
+
+{% if it.url %}
+  <div class="mt-3"><a class="btn btn-sm btn-outline-secondary" href="{{ it.url }}" target="_blank" rel="noopener">Original</a></div>
+{% endif %}
+{% endblock %}
