@@ -1,6 +1,6 @@
 # app.py
 import subprocess, sys
-from ctiapp import create_app
+from .ctiapp import create_app
 
 app = create_app()
 
