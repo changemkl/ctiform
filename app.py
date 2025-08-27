@@ -590,7 +590,10 @@ def add_rss():
         upsert=True
     )
 
-    ar = run_fetch_user_rss_once.delay(owner_name, rss_url, 200)
+    ar = run_fetch_user_rss_once.apply_async(
+    args=[owner_name, rss_url, 200],
+    queue="realtime",
+    )
     flash(f"RSS saved & initial fetch queued (task: {ar.id})", "success")
     return redirect(url_for("feed"))
 
@@ -1199,11 +1202,65 @@ TPL_ITEM = r"""
 """
 
 # ----------------- Entry -----------------
+import os, sys, subprocess, signal, time
+
+def _popen(cmd, name):
+    print(f"[spawn] {name}: {' '.join(cmd)}")
+    # Windows: 创建新进程组，方便后续关闭；Linux/macOS: start_new_session=True
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return subprocess.Popen(cmd, creationflags=creationflags)
+    else:
+        return subprocess.Popen(cmd, start_new_session=True)
+
 if __name__ == "__main__":
-    celery_proc = subprocess.Popen(
-        [sys.executable, "-m", "celery", "-A", "worker.tasks", "worker", "-l", "info", "--pool=solo"]
-    )
+    # 仅在 reloader 的子进程里启动 Celery，避免重复
+    is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not os.environ.get("FLASK_DEBUG")
+    
+    celery_procs = []
+
+    if is_reloader_child:
+        # —— 两个 worker：realtime / scheduled —— 
+        # 注意 -A 指向你的 Celery app 定义模块（这里是 worker.celery_app），不是 worker.tasks
+        realtime_cmd  = [sys.executable, "-m", "celery", "-A", "worker.celery_app",
+                         "worker", "-l", "info", "-P", "solo", "-Q", "realtime", "-n", "worker.realtime@%h"]
+        scheduled_cmd = [sys.executable, "-m", "celery", "-A", "worker.celery_app",
+                         "worker", "-l", "info", "-P", "solo", "-Q", "scheduled", "-n", "worker.scheduled@%h"]
+
+        celery_procs.append(_popen(realtime_cmd,  "celery[realtime]"))
+        celery_procs.append(_popen(scheduled_cmd, "celery[scheduled]"))
+
+        # —— 如需 beat（定时任务），再开一个 —— 
+        # 若不需要，注释掉下面两行即可；或设置环境变量 DISABLE_BEAT=1 让你的配置不加载 beat_schedule
+        if os.getenv("DISABLE_BEAT", "0") != "1":
+            beat_cmd = [sys.executable, "-m", "celery", "-A", "worker.celery_app", "beat", "-l", "info"]
+            celery_procs.append(_popen(beat_cmd, "celery[beat]"))
+
     try:
+        # 运行 Flask
+        # 提示：生产环境别用 debug=True（会启动 reloader）；开发期可保留
         app.run(debug=True)
     finally:
-        celery_proc.terminate()
+        # 优雅关闭子进程
+        for p in celery_procs:
+            try:
+                if os.name == "nt":
+                    # Windows: 发送 CTRL_BREAK_EVENT 可能更优雅；退一步用 terminate()
+                    p.terminate()
+                else:
+                    os.killpg(p.pid, signal.SIGTERM)  # 发送给进程组
+            except Exception:
+                pass
+
+        # 等待子进程退出，超时则强杀
+        deadline = time.time() + 10
+        for p in celery_procs:
+            try:
+                while p.poll() is None and time.time() < deadline:
+                    time.sleep(0.2)
+                if p.poll() is None:
+                    p.kill()
+            except Exception:
+                pass
+
