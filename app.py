@@ -733,10 +733,7 @@ TPL_FEED = r"""
 
 <div class="container py-3">
 
-  <div class="d-flex align-items-center gap-3 mb-3">
-    <button id="btnFetch" class="btn btn-success btn-sm" type="button">Fetch now</button>
-    <span id="fetchStatus" class="small text-muted"></span>
-  </div>
+
 
   <form method="get" class="row g-2 mb-4">
     <div class="col-md-4">
