@@ -34,7 +34,7 @@ celery.conf.update(
 
     # —— 结果后端（如果你不查结果，建议忽略结果） —— 
     result_backend=BACKEND_URL,
-    redis_max_connections=5,              # ★ 关键：限制后端连接
+    redis_max_connections=2,              # ★ 关键：限制后端连接
     result_expires=300,                   # 结果保留时间
     result_persistent=False,              # 不持久化结果文件
     task_ignore_result=True,              # ★ 全局忽略结果（最省连接）
