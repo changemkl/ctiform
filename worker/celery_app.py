@@ -26,7 +26,7 @@ celery.conf.update(
     # —— 限连接&更稳 —— 
     broker_connection_retry_on_startup=True,
     broker_heartbeat=30,                  # 心跳别太频繁
-    broker_pool_limit=5,                  # ★ 关键：限制 broker 连接池
+    broker_pool_limit=2,                  # ★ 关键：限制 broker 连接池
     broker_transport_options={
         "max_connections": 5,             # ★ 关键：Redis 传输连接上限
         "visibility_timeout": 3600,
