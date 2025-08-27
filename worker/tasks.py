@@ -45,6 +45,7 @@ def run_fetch():
 # ---------- 用户定向抓取 ----------
 @celery.task(bind=True, name="worker.tasks.run_fetch_user_rss_once")
 def run_fetch_user_rss_once(self, owner_username: str, rss_url: str, limit: int = 200):
+    logger.info("run_fetch_user_rss_once owner=%s url=%s limit=%s", owner_username, rss_url, limit)
     try:
         from task_fetch import fetch_user_rss_once as _fetch_user_rss_once
     except ImportError:
@@ -103,21 +104,4 @@ def run_fetch_and_reco(self):
 def run_cybok_reco_gridfs():
     return _run("task_cybok_reco_gridfs.py")
 
-# ---------- worker 启动时触发一次 ----------
-def _should_kick_once(ttl_seconds=300) -> bool:
-    url = os.getenv("REDIS_URL",
-        "redis://default:FY0eHpAwCj2eRxoTiUcJTn4T8dkmLWGE@redis-14436.c114.us-east-1-4.ec2.redns.redis-cloud.com:14436/0")
-    r = redis.from_url(url)
-    key = "once:kickoff:run_fetch_and_reco"
-    ok = r.setnx(key, int(time.time()))
-    if ok:
-        r.expire(key, ttl_seconds)
-    return ok
 
-@worker_ready.connect
-def _kickoff_on_worker_ready(sender, **kwargs):
-    try:
-        if _should_kick_once(ttl_seconds=300):
-            sender.app.send_task("worker.tasks.run_fetch_and_reco")
-    except Exception as e:
-        print(f"[worker_ready] kickoff failed: {e}")
